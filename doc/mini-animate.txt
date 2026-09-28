@@ -20,6 +20,9 @@ Features:
 - Animate window open/close with visually updating floating window.
   See |MiniAnimate.config.open| and |MiniAnimate.config.close| for more details.
 
+- Animate split window open/close by moving split line from/to right or
+  bottom edge. See |MiniAnimate.config.split| for more details.
+
 - Timings for all actions can be customized independently.
   See |MiniAnimate-timing| for more details.
 
@@ -34,12 +37,12 @@ Notes:
 - Cursor movement is animated inside same window and buffer, not as cursor
   moves across the screen.
 
-- Scroll and resize animations are done with "side effects": they actually
-  change the state of what is animated (window view and sizes
-  respectively). This has a downside of possibly needing extra work to
+- Scroll, resize, and split open animations are done with "side effects":
+  they actually change the state of what is animated (window view and
+  sizes respectively). This has a downside of possibly needing extra work to
   account for asynchronous nature of animation (like adjusting certain
-  mappings, etc.). See |MiniAnimate.config.scroll| and
-  |MiniAnimate.config.resize| for more details.
+  mappings, etc.). See |MiniAnimate.config.scroll|,
+  |MiniAnimate.config.resize|, and |MiniAnimate.config.split| for more details.
 
 # Setup ~
 
@@ -179,6 +182,18 @@ Defaults ~
 
       -- 'winblend' (window transparency) generator for floating window
       winblend = --<function: implements equal linear steps from 80 to 100>,
+    },
+
+    -- Window split (split line movement on split window open/close)
+    split = {
+      -- Whether to enable this animation
+      enable = true,
+
+      -- Timing of animation (how steps will progress in time)
+      timing = --<function: linear animation, total 250ms>,
+
+      -- Subsplit generator for all steps of split line movement
+      subsplit = --<function: implements equal steps with at most 60 steps>,
     },
   }
 <
@@ -375,6 +390,11 @@ These animations are similarly triggered for regular (non-floating) window
 open/close. Their visualization step consists from drawing empty floating
 window with customizable config and transparency.
 
+Note: if |MiniAnimate.config.split| animation is enabled, it is used instead
+of these for windows opened as a split and closed while not being the only
+window in tabpage. These animations are then used for other windows (like
+the first window in a new tabpage).
+
 Exact window visualization characteristics are controlled by `winconfig`
 and `winblend` options.
 
@@ -440,6 +460,63 @@ Configuration example: >lua
 <
 After animation is done, `MiniAnimateDoneOpen` or `MiniAnimateDoneClose`
 event is triggered for `open` and `close` animation respectively.
+
+# Window split ~
+*MiniAnimate.config.split*
+
+This animation is triggered when regular (non-floating) window is opened as
+a split (like with |:vsplit|, |:split|, |CTRL-W_v|, |:new|) or closed while
+not being the only window in tabpage (like with |:quit|, |:close|, |:only|).
+It takes precedence over `open` and `close` animations for such windows.
+
+Its visualization is a moving split line (window separator or status line):
+- On open, split line between new window and the one it was split from
+  flies in from the right (for vertical split) or bottom (for horizontal
+  split) edge of their combined area. This is done by actually resizing
+  these windows (similar to resize animation).
+- On close, split line flies out to the right or bottom edge of the area
+  freed by closed window(s). As closed window can not be resized anymore,
+  what was shown after the split line (window text, separators, status
+  lines) is imitated with floating windows. They are shown over the actual
+  final layout and are gradually squeezed out.
+
+Exact split line positions and their number is controlled by `subsplit`
+option. It is a callable which takes `size_from` and `size_to` arguments
+(both non-negative integers) and returns array of sizes for every step
+(last one usually being equal to `size_to`). Size is a number of cells
+after the split line (to the right of vertical or below horizontal one):
+- Open animation goes from the smallest possible size to the final size.
+- Close animation goes from the size of freed area to 0.
+Example:
+- Input `(0, 10)` means that split line travels 10 cells from the edge.
+- Output `{ 2, 4, 6, 8, 10 }` means that it is done in five equal steps.
+
+See |MiniAnimate.gen_subsplit| for builtin subsplit generators.
+
+Notes:
+- Open animation has the same consequences as resize animation, as it
+  actually changes window sizes. Use |MiniAnimate.execute_after()| to
+  schedule action after reaching target window sizes.
+- Open animation moves only the split line between new window and the one
+  it was split from. If other windows are resized as a result of a split
+  (like due to 'equalalways'), they get their final sizes immediately.
+- Close animation shows window text only if its buffer is still loaded and
+  is not a terminal (to not resize its job). Otherwise empty buffer is shown.
+
+Configuration example: >lua
+
+  local animate = require('mini.animate')
+  animate.setup({
+    split = {
+      -- Animate for 150 milliseconds with quadratic easing
+      timing = animate.gen_timing.quadratic({ duration = 150, unit = 'total' }),
+
+      -- Animate with at most 30 steps
+      subsplit = animate.gen_subsplit.equal({ max_output_steps = 30 }),
+    },
+  })
+<
+After animation is done, `MiniAnimateDoneSplit` event is triggered.
 
 ------------------------------------------------------------------------------
                                                        *MiniAnimate.is_active()*
@@ -932,6 +1009,49 @@ Parameters ~
 Return ~
 `(function)` Winblend function (see |MiniAnimate.config.open|
   or |MiniAnimate.config.close|).
+
+------------------------------------------------------------------------------
+                                                      *MiniAnimate.gen_subsplit*
+                           `MiniAnimate.gen_subsplit`
+Generate split animation subsplit
+
+For more information see |MiniAnimate.config.split|.
+
+This is a table with function elements. Call to actually get generator.
+
+Example: >lua
+
+  local is_big_move = function(size_from, size_to)
+    return math.abs(size_to - size_from) >= 10
+  end
+  local animate = require('mini.animate')
+  animate.setup({
+    split = {
+      -- Animate only if split line moves at least 10 cells and use at
+      -- most 120 steps instead of default 60
+      subsplit = animate.gen_subsplit.equal({
+        predicate = is_big_move,
+        max_output_steps = 120,
+      }),
+    },
+  })
+<
+------------------------------------------------------------------------------
+                                              *MiniAnimate.gen_subsplit.equal()*
+                    `MiniAnimate.gen_subsplit.equal`({opts})
+Generate subsplit with equal steps
+
+Parameters ~
+{opts} `(table|nil)` Options that control generator. Possible keys:
+  - <predicate> `(function)` - a callable which takes `size_from` and
+    `size_to` as input and returns boolean value indicating whether
+    animation should be done. Default: always `true`.
+  - <max_output_steps> `(number)` - maximum number of steps in output.
+    Adjust this to reduce computations in expense of reduced smoothness.
+    Default: 60.
+
+Return ~
+`(function)` Subsplit function (see |MiniAnimate.config.split|).
 
 
  vim:tw=78:ts=8:noet:ft=help:norl:
