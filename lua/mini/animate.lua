@@ -428,7 +428,8 @@ end
 --- - Close animation: number of cells between split line and the edge of
 ---   container (including separators and status lines) going to 0. It is
 ---   computed for every container which had closed window(s), as there can be
----   several of them (like after |:only|).
+---   several of them (like after |:only|). Their steps are evenly spread over
+---   the whole animation, so that all split lines reach the edge together.
 --- Example:
 --- - Input `(0, 10)` means that split line travels 10 cells from the edge.
 --- - Output `{ 2, 4, 6, 8, 10 }` means that it is done in five equal steps.
@@ -2310,9 +2311,17 @@ H.make_split_close_step = function(data, opts)
   -- Floating windows per imitated window. Track if some were closed not by
   -- animation, as they should not be reopened.
   local floats, is_closed_outside = {}, false
+  local get_size = function(r, step)
+    local n = #r.step_sizes
+    if n == 0 then return step == 0 and r.size or 0 end
+    -- Stretch steps of every region so that all of them finish together
+    local ind = math.ceil(step * n / n_steps)
+    if step < n_steps then ind = math.min(ind, n - 1) end
+    return ind == 0 and r.size or r.step_sizes[ind]
+  end
   local draw = function(step)
     for _, r in ipairs(regions) do
-      local size = step == 0 and r.size or (r.step_sizes[math.min(step, #r.step_sizes)] or 0)
+      local size = get_size(r, step)
       for _, w in ipairs(r.wins) do
         floats[w.win_id] = floats[w.win_id] or {}
         is_closed_outside = is_closed_outside or not H.draw_split_floats(floats[w.win_id], w, r, size)

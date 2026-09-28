@@ -493,7 +493,8 @@ split line (to the right of vertical or below horizontal one):
 - Close animation: number of cells between split line and the edge of
   container (including separators and status lines) going to 0. It is
   computed for every container which had closed window(s), as there can be
-  several of them (like after |:only|).
+  several of them (like after |:only|). Their steps are evenly spread over
+  the whole animation, so that all split lines reach the edge together.
 Example:
 - Input `(0, 10)` means that split line travels 10 cells from the edge.
 - Output `{ 2, 4, 6, 8, 10 }` means that it is done in five equal steps.
