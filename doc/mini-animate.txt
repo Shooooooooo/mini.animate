@@ -521,6 +521,8 @@ Notes:
   separate floating windows (using |hl-WinSeparator|, |hl-StatusLine|,
   |hl-StatusLineNC|, |hl-WinBar|, |hl-WinBarNC| highlight groups), so they
   might look slightly different from actual ones.
+  On Neovim<0.11 resizing floating windows triggers |WinResized| and
+  |WinScrolled| events (as there is no |'eventignorewin'|).
 
 Configuration example: >lua
 
