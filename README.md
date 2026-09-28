@@ -33,6 +33,7 @@ https://user-images.githubusercontent.com/24854248/215829092-5aba4e8d-94a5-43da-
 - Animate **scrolling** with a series of subscrolls ("smooth scrolling").
 - Animate **window resize** by gradually changing sizes of all windows.
 - Animate **window open/close** with visually updating floating window.
+- Animate **split window open/close** by moving split line from/to right or bottom edge.
 - Timings for all actions can be customized independently.
 - Action animations can be enabled/disabled independently.
 - All animations are asynchronous/non-blocking and trigger a targeted event which can be used to perform actions after animation is done.
@@ -40,7 +41,7 @@ https://user-images.githubusercontent.com/24854248/215829092-5aba4e8d-94a5-43da-
 
 Notes:
 
-- Scroll and resize animations actually change Neovim state to achieve their effects and are asynchronous. This can cause following issues:
+- Scroll, resize, and split open animations actually change Neovim state to achieve their effects and are asynchronous. This can cause following issues:
     - If you have remapped any movement operation to center after it is done (like with `nzvzz` or `<C-d>zz`), you need to change those mappings. Either remove them or update to use `MiniAnimate.execute_after()` (see `:h MiniAnimate.config.scroll`)
     - Using mouse wheel to scroll can appear slower or can have visual jitter. This usually happens due to high number of wheel turns per second: each turn is taking over previous one to start new animation. To mitigate this, you can either modify 'mousescroll' option (set vertical scroll to 1 and use high turn speed or set to high value and use one turn at a time) or `config.scroll` to fine tune when/how scroll animation is done.
 
@@ -202,6 +203,18 @@ Stable branch:
 
     -- 'winblend' (window transparency) generator for floating window
     winblend = --<function: implements equal linear steps from 80 to 100>,
+  },
+
+  -- Window split (split line movement on split window open/close)
+  split = {
+    -- Whether to enable this animation
+    enable = true,
+
+    -- Timing of animation (how steps will progress in time)
+    timing = --<function: implements linear total 250ms animation duration>,
+
+    -- Subsplit generator for all steps of split line movement
+    subsplit = --<function: implements equal steps with at most 60 steps>,
   },
 }
 ```
