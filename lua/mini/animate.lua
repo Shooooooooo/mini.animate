@@ -442,7 +442,8 @@ end
 ---   other places.
 --- - Open animation has the same consequences as resize animation, as it
 ---   actually changes window sizes. It is stopped (keeping current sizes) if
----   window sizes are changed during animation not by it.
+---   sizes of animated windows are changed during animation not by it.
+---   Size changes of other windows are preserved.
 --- - Open animation moves only the split line between new window and the one
 ---   it was split from. If other windows are resized as a result of a split
 ---   (like due to |'equalalways'|), they get their final sizes immediately.
@@ -450,10 +451,10 @@ end
 ---   to be below other floating windows. They show text only of regular
 ---   buffers (with empty |'buftype'|) which are still loaded, otherwise an
 ---   empty buffer is shown.
----   Separators, status lines, and winbars are imitated with borders (using
----   |hl-WinSeparator|, |hl-StatusLine|, |hl-StatusLineNC|, |hl-WinBar|,
----   |hl-WinBarNC| highlight groups), so they might look slightly different
----   from actual ones. Winbar is not shown if it is directly below split line.
+---   Separators, status lines, and winbars are imitated with borders or
+---   separate floating windows (using |hl-WinSeparator|, |hl-StatusLine|,
+---   |hl-StatusLineNC|, |hl-WinBar|, |hl-WinBarNC| highlight groups), so they
+---   might look slightly different from actual ones.
 ---
 --- Configuration example: >lua
 ---
@@ -1298,11 +1299,13 @@ H.cache = {
   -- Scroll animation data
   scroll_event_id = 0,
   scroll_is_active = false,
+  scroll_is_executing = false,
   scroll_state = { buf_id = nil, win_id = nil, view = {}, cursor = {} },
 
   -- Resize animation data
   resize_event_id = 0,
   resize_is_active = false,
+  resize_target = nil,
   resize_state = { layout = {}, sizes = {}, views = {} },
 
   -- Window open animation data
@@ -1321,8 +1324,9 @@ H.cache = {
   -- Data about split window open/close waiting for layout to settle
   split_pending_open = nil,
   split_pending_close = nil,
-  -- Floating windows used in close animation
+  -- Floating windows and (reusable) buffers used in close animation
   split_floats = {},
+  split_line_bufs = {},
   -- Callable to immediately finish current animation
   split_finish = nil,
 }
@@ -1525,6 +1529,7 @@ H.auto_resize = function()
   if not animate_step then return end
 
   H.start_resize(prev_state)
+  H.cache.resize_target = new_state
   MiniAnimate.animate(animate_step.step_action, animate_step.step_timing)
 end
 
@@ -1676,7 +1681,7 @@ H.auto_split = function()
   H.close_split_floats()
   if H.cache.resize_is_active then
     H.cache.resize_event_id = H.cache.resize_event_id + 1
-    H.stop_resize()
+    H.finish_resize()
   end
 
   -- Make animation step data and possibly animate
@@ -1694,10 +1699,11 @@ end
 
 H.on_key = function()
   -- Finish split animation right away on any key, as its effect might depend
-  -- on final layout (like window navigation, resize, scroll, etc.)
+  -- on final layout (like window navigation, resize, scroll, etc.). Ignore
+  -- keys from scroll animation, as it can be active at the same time.
   local finish = H.cache.split_finish
-  if finish == nil then return end
-  H.cache.split_event_id = H.cache.split_event_id + 1
+  if finish == nil or H.cache.scroll_is_executing then return end
+  H.cache.split_event_id, H.cache.split_finish = H.cache.split_event_id + 1, nil
   pcall(finish)
   -- Don't error inside key listener as it will be removed. Show it later.
   local ok, err = pcall(H.stop_split)
@@ -1849,7 +1855,10 @@ H.scroll_action = function(key, n, cursor_data)
   -- cursor immediately, which reduces flicker.
   if n ~= nil and n > 0 then
     local command = string.format('normal! %d%s', n, key)
-    vim.cmd(command)
+    H.cache.scroll_is_executing = true
+    local ok, err = pcall(vim.cmd, command)
+    H.cache.scroll_is_executing = false
+    if not ok then error(err, 0) end
   end
 
   -- Set cursor to properly handle cursor position
@@ -1962,9 +1971,33 @@ end
 
 H.stop_resize = function(end_state)
   if end_state ~= nil then H.apply_resize_state(end_state, true) end
-  H.cache.resize_is_active = false
+  H.cache.resize_is_active, H.cache.resize_target = false, nil
   H.trigger_done_event('resize')
   return false
+end
+
+-- Finish active resize animation before layout is changed not by it (like
+-- from split animation). Apply its final sizes only to windows and dimensions
+-- not changed since its last step (like after split), as others are outdated.
+H.finish_resize = function()
+  local target, last, sizes = H.cache.resize_target, H.cache.resize_state, {}
+  if target ~= nil and vim.deep_equal(target.layout, last.layout) then
+    for win_id, dims in pairs(target.sizes) do
+      local last_dims = last.sizes[win_id]
+      if vim.api.nvim_win_is_valid(win_id) and last_dims ~= nil then
+        local height, width = vim.api.nvim_win_get_height(win_id), vim.api.nvim_win_get_width(win_id)
+        sizes[win_id] = {
+          height = height == last_dims.height and dims.height or height,
+          width = width == last_dims.width and dims.width or width,
+        }
+      end
+    end
+  end
+  -- Apply twice as setting size of one window can affect others
+  for _ = 1, 2 do
+    pcall(H.apply_resize_state, { sizes = sizes }, false)
+  end
+  H.stop_resize()
 end
 
 H.get_resize_state = function()
@@ -2119,6 +2152,7 @@ H.make_split_open_step = function(data, opts)
 
   local all_wins = H.get_layout_windows(layout)
   local pair_wins = vim.list_extend(H.get_layout_windows(first), H.get_layout_windows(second))
+  local other_wins = vim.tbl_filter(function(id) return not vim.tbl_contains(pair_wins, id) end, all_wins)
   local get_sizes = function(win_ids)
     local res = {}
     for _, id in ipairs(win_ids) do
@@ -2154,8 +2188,10 @@ H.make_split_open_step = function(data, opts)
   end
 
   -- Resize all pair windows (not only setter) to proportionally resize the
-  -- ones inside nested containers. Set split line position the last.
+  -- ones inside nested containers. Set split line position first (to not take
+  -- space from outside of pair) and the last (to ensure its position).
   local ordered_wins = vim.tbl_filter(function(id) return id ~= setter_id end, pair_wins)
+  table.insert(ordered_wins, 1, setter_id)
   table.insert(ordered_wins, setter_id)
   local apply_step = function(size)
     local coef = second_to == second_from and 1 or ((size - second_from) / (second_to - second_from))
@@ -2170,7 +2206,10 @@ H.make_split_open_step = function(data, opts)
   -- Track state after every step to stop if changed not by animation and to
   -- restore views at the end only if there was no cursor movement (like
   -- from other scripts, as it might be scrolled because of resize)
-  local last_sizes, cursors, is_moved = {}, {}, {}
+  local last_sizes, cursors, is_moved, bufs = {}, {}, {}, {}
+  for _, id in ipairs(pair_wins) do
+    bufs[id] = vim.api.nvim_win_get_buf(id)
+  end
   local track_state = function()
     last_sizes = get_sizes(pair_wins)
     for _, id in ipairs(pair_wins) do
@@ -2179,21 +2218,36 @@ H.make_split_open_step = function(data, opts)
   end
   local track_moved = function()
     for _, id in ipairs(pair_wins) do
-      is_moved[id] = is_moved[id] or not vim.deep_equal(cursors[id], vim.api.nvim_win_get_cursor(id))
+      local is_same = vim.deep_equal(cursors[id], vim.api.nvim_win_get_cursor(id))
+        and vim.api.nvim_win_get_buf(id) == bufs[id]
+      is_moved[id] = is_moved[id] or not is_same
     end
   end
   track_state()
 
+  -- Check if state was changed not by animation: layout or pair sizes
   local tabpage_id = vim.api.nvim_get_current_tabpage()
-  local is_same_layout = function()
-    if not vim.api.nvim_tabpage_is_valid(tabpage_id) then return false end
-    return vim.deep_equal(vim.fn.winlayout(vim.api.nvim_tabpage_get_number(tabpage_id)), layout)
+  local is_changed_outside = function()
+    if not vim.api.nvim_tabpage_is_valid(tabpage_id) then return true end
+    local cur_layout = vim.fn.winlayout(vim.api.nvim_tabpage_get_number(tabpage_id))
+    return not (vim.deep_equal(cur_layout, layout) and vim.deep_equal(get_sizes(pair_wins), last_sizes))
+  end
+
+  -- Use current sizes of other windows as target to not revert their resize
+  -- done not by animation. This is safe as pair sizes are checked beforehand.
+  local sync_others = function()
+    for _, id in ipairs(other_wins) do
+      local sizes = { height = vim.api.nvim_win_get_height(id), width = vim.api.nvim_win_get_width(id) }
+      state_to.sizes[id], sizes_to[id] = sizes, sizes[dim]
+    end
   end
 
   local finish = function()
-    if not is_same_layout() then return end
+    if is_changed_outside() then return end
     track_moved()
+    sync_others()
     H.set_win_sizes(sizes_to, dim, ordered_wins)
+    if not H.is_resize_state_kept(state_to, pair_wins) then restore_final() end
     for _, id in ipairs(pair_wins) do
       if not is_moved[id] then vim.api.nvim_win_call(id, function() vim.fn.winrestview(state_to.views[id]) end) end
     end
@@ -2209,13 +2263,14 @@ H.make_split_open_step = function(data, opts)
       -- `stop_split()` because it will also stop parallel animation.
       if H.cache.split_event_id ~= event_id then return false end
 
-      -- Stop animation without changes if layout or sizes were changed not by
-      -- animation (like if window was closed or resized)
-      if not (is_same_layout() and vim.deep_equal(get_sizes(pair_wins), last_sizes)) then return H.stop_split() end
+      -- Stop animation without changes if layout or pair sizes were changed
+      -- not by animation (like if window was closed or resized)
+      if is_changed_outside() then return H.stop_split() end
 
       -- Perform animation. Ensure that only pair windows are affected (as it
       -- is not always the case, like with windows of fixed size).
       track_moved()
+      sync_others()
       local ok_step = pcall(apply_step, step_sizes[step])
       if not (ok_step and H.is_resize_state_kept(state_to, pair_wins)) then
         restore_final()
@@ -2252,21 +2307,23 @@ H.make_split_close_step = function(data, opts)
   end
   if n_steps == 0 then return end
 
-  -- Floating window data per window: id, `nil` if hidden, `false` if closed
-  -- not by animation (should not be reopened)
+  -- Floating windows per imitated window. Track if some were closed not by
+  -- animation, as they should not be reopened.
   local floats, is_closed_outside = {}, false
   local draw = function(step)
     for _, r in ipairs(regions) do
       local size = step == 0 and r.size or (r.step_sizes[math.min(step, #r.step_sizes)] or 0)
       for _, w in ipairs(r.wins) do
-        if floats[w.win_id] ~= false then floats[w.win_id] = H.draw_split_float(floats[w.win_id], w, r, size) end
-        is_closed_outside = is_closed_outside or floats[w.win_id] == false
+        floats[w.win_id] = floats[w.win_id] or {}
+        is_closed_outside = is_closed_outside or not H.draw_split_floats(floats[w.win_id], w, r, size)
       end
     end
   end
   local close_floats = function()
-    for _, float_win_id in pairs(floats) do
-      if float_win_id then H.close_split_floats(float_win_id) end
+    for _, win_floats in pairs(floats) do
+      for _, float_win_id in pairs(win_floats) do
+        H.close_split_floats(float_win_id)
+      end
     end
     floats = {}
   end
@@ -2290,7 +2347,7 @@ H.make_split_close_step = function(data, opts)
       -- Stop animation if its floating windows are not visible or interfere:
       -- tabpage has changed, some were closed outside, one became current.
       local cur_win_id = vim.api.nvim_get_current_win()
-      if vim.tbl_contains(vim.tbl_values(floats), cur_win_id) then pcall(vim.cmd, 'wincmd p') end
+      if H.cache.split_floats[cur_win_id] then pcall(vim.cmd, 'wincmd p') end
       local is_ok = vim.api.nvim_get_current_tabpage() == tabpage_id
         and not is_closed_outside
         and vim.api.nvim_get_current_win() == cur_win_id
@@ -2482,82 +2539,153 @@ H.get_split_line_statusline = function(snapshot, w, row)
   return H.drop_cells(res, w.left - aboves[1].left)
 end
 
--- Draw floating window emulating window `w` inside squeezed region `r`.
--- Return window id, `nil` if it should be hidden, `false` if closed outside.
-H.draw_split_float = function(float_win_id, w, r, size)
-  if float_win_id ~= nil and not vim.api.nvim_win_is_valid(float_win_id) then return false end
+-- Draw floating windows imitating window `w` inside squeezed region `r`.
+-- Update `floats` (with part names as keys and window ids as values) in place.
+-- Return `false` if some of them was closed not by animation.
+H.draw_split_floats = function(floats, w, r, size)
+  for _, float_win_id in pairs(floats) do
+    if not vim.api.nvim_win_is_valid(float_win_id) then return false end
+  end
 
   -- Map frame coordinates into squeezed region. Line is at `r.to - size`.
   local is_vert = r.dim == 'width'
   local line, coef = r.to - size, size / r.size
   local map = function(x) return line + 1 + H.round((x - r.from - 1) * coef) end
 
-  -- Compute frame in squeezed region
+  -- Compute frame in squeezed region and configs of all window parts
   local from_key, to_key = unpack(is_vert and { 'left', 'right' } or { 'top', 'bottom' })
-  local frame_from, frame_to = map(w[from_key]), map(w[to_key] + 1) - 1
-  local has_line = w[from_key] == r.from + 1
+  local frame = { from = map(w[from_key]), to = map(w[to_key] + 1) - 1, has_line = w[from_key] == r.from + 1 }
+  local configs = (is_vert and H.get_split_vert_configs or H.get_split_horiz_configs)(w, r, frame)
 
-  -- Floating window doesn't show winbar, so imitate it with top border (if
-  -- possible, as split line has priority in horizontal region)
+  for name, float_win_id in pairs(floats) do
+    if configs[name] == nil then
+      H.close_split_floats(float_win_id)
+      floats[name] = nil
+    end
+  end
+  -- Use fixed order for consistent window layering
+  for _, name in ipairs({ 'text', 'line', 'winbar', 'statusline' }) do
+    local config = configs[name]
+    if config ~= nil and floats[name] ~= nil then
+      vim.api.nvim_win_set_config(floats[name], config.win_config)
+    elseif config ~= nil and config.line ~= nil then
+      floats[name] = H.open_split_line_float(config)
+    elseif config ~= nil then
+      floats[name] = H.open_split_float(w, config.win_config)
+    end
+  end
+  return true
+end
+
+-- Vertical region: imitate window with a single floating window. Use borders
+-- to show separators (left always exists), status line, and winbar. Their
+-- text is shown correctly as there is left border.
+H.get_split_vert_configs = function(w, r, frame)
   local has_vsep, has_stl = w.right > w.left + w.width - 1, w.bottom > w.text_top + w.height - 1
-  local is_top_line, is_top_winbar = has_line and not is_vert, w.winbar == 1 and not (has_line and not is_vert)
-  local width, height = w.width, w.height
-  if is_vert then
-    width = frame_to - frame_from + 1 - (has_vsep and 1 or 0)
-  else
-    height = frame_to - frame_from + 1 - (has_stl and 1 or 0) - (is_top_winbar and 1 or 0)
-  end
+  local width = frame.to - frame.from + 1 - (has_vsep and 1 or 0)
+  if width < 1 then return {} end
 
-  -- Hide if there is no text area to show
-  if width < 1 or height < 1 then
-    if float_win_id ~= nil then H.close_split_floats(float_win_id) end
-    return nil
-  end
-
-  -- Use borders to show window separators, status lines, and split line.
-  -- Vertical region: show separator on the left (as it always exists).
-  -- Horizontal region: show separator on the top only for split line.
-  local top = is_top_line and r.line_border or (is_top_winbar and w.winbar_border or '')
-  local right = (not is_vert and has_vsep) and w.vert_border or ''
+  local top = w.winbar == 1 and w.winbar_border or ''
   local bottom = has_stl and w.horiz_border or ''
-  local left = is_vert and (has_line and r.line_border or w.vert_border) or ''
-  -- Window separator goes through winbar but not through status line
-  local corner = function(a, b, char) return (a ~= '' and b ~= '') and (char or a) or '' end
-  local top_right = is_top_winbar and corner(right, top) or corner(top, right)
-  local bottom_left = corner(bottom, left, w.corner_border)
-  local border = { corner(left, top), top, top_right, right, corner(bottom, right), bottom, bottom_left, left }
-
+  local left = frame.has_line and r.line_border or w.vert_border
+  local bottom_left = bottom ~= '' and w.corner_border or ''
   --stylua: ignore
   local config = {
     relative  = 'editor',
     anchor    = 'NW',
-    row       = is_vert and w.top or (frame_from - (is_top_line and 1 or 0)),
-    col       = is_vert and (frame_from - 1) or w.left,
+    row       = w.top,
+    col       = frame.from - 1,
     width     = width,
-    height    = height,
+    height    = w.height,
     focusable = false,
     zindex    = 1,
-    border    = border,
+    border    = { top ~= '' and left or '', top, '', '', '', bottom, bottom_left, left },
   }
+  if top ~= '' and w.winbar_line ~= nil then
+    config.title, config.title_pos = w.winbar_line, 'left'
+  end
+  if bottom ~= '' and w.statusline ~= nil then
+    config.footer, config.footer_pos = w.statusline, 'left'
+  end
+  return { text = { win_config = config } }
+end
 
-  -- Show status line content. It is truncated to fit, but always shown
-  -- starting from second border cell (so remove first cell if no left border).
-  local title, footer = is_top_line and w.line_statusline or w.winbar_line, w.statusline
-  if left == '' then
-    title, footer = H.drop_cells(title, 1), H.drop_cells(footer, 1)
+-- Horizontal region: imitate text area with a floating window (with right
+-- separator as border) and split line, winbar, status line as separate ones
+-- (as there is no left border to show their text correctly).
+H.get_split_horiz_configs = function(w, r, frame)
+  local has_vsep, has_stl = w.right > w.left + w.width - 1, w.bottom > w.text_top + w.height - 1
+  local height = frame.to - frame.from + 1 - w.winbar - (has_stl and 1 or 0)
+  if height < 1 then return {} end
+
+  local base_config = { relative = 'editor', anchor = 'NW', col = w.left, focusable = false, zindex = 1 }
+  local text_config = vim.tbl_extend('force', base_config, {
+    row = frame.from + w.winbar,
+    width = w.width,
+    height = height,
+    border = has_vsep and { '', '', '', w.vert_border, '', '', '', '' } or 'none',
+  })
+
+  local res = { text = { win_config = text_config } }
+  local line_width = w.width + (has_vsep and 1 or 0)
+  local add_line = function(name, row, chunks, fill, tail)
+    local config = vim.tbl_extend('force', base_config, { row = row, width = line_width, height = 1, border = 'none' })
+    res[name] = { win_config = config, line = { chunks = chunks, fill = fill, tail = tail, width = line_width } }
   end
-  if top ~= '' and title ~= nil then
-    config.title, config.title_pos = title, 'left'
+  if frame.has_line then add_line('line', frame.from - 1, w.line_statusline, r.line_border) end
+  if w.winbar == 1 then add_line('winbar', frame.from, w.winbar_line, w.winbar_border, has_vsep and w.vert_border) end
+  if has_stl then add_line('statusline', frame.to, w.statusline, w.horiz_border) end
+  return res
+end
+
+-- Open floating window showing single line of highlighted text
+H.open_split_line_float = function(config)
+  -- Compute line content: text chunks padded with fill character up to width
+  local data = config.line
+  local text_width = data.width - (data.tail and 1 or 0)
+  local chunks = H.truncate_cells(data.chunks or {}, text_width)
+  local n_fill = text_width
+  for _, chunk in ipairs(chunks) do
+    n_fill = n_fill - vim.fn.strdisplaywidth(chunk[1])
   end
-  if bottom ~= '' and footer ~= nil then
-    config.footer, config.footer_pos = footer, 'left'
+  if n_fill > 0 then table.insert(chunks, { string.rep(data.fill[1], n_fill), data.fill[2] }) end
+  if data.tail then table.insert(chunks, data.tail) end
+
+  local buf_id = H.get_split_line_buf()
+  local line = table.concat(vim.tbl_map(function(c) return c[1] end, chunks))
+  vim.api.nvim_buf_set_lines(buf_id, 0, -1, false, { line })
+  local col = 0
+  for _, chunk in ipairs(chunks) do
+    local extmark_opts = { end_col = col + chunk[1]:len(), hl_group = chunk[2] }
+    pcall(vim.api.nvim_buf_set_extmark, buf_id, H.ns_id.split, 0, col, extmark_opts)
+    col = col + chunk[1]:len()
   end
 
-  if float_win_id ~= nil then
-    vim.api.nvim_win_set_config(float_win_id, config)
-    return float_win_id
+  -- Don't trigger any events
+  local win_config = vim.tbl_extend('force', config.win_config, { noautocmd = true, style = 'minimal' })
+  local ok, float_win_id = pcall(vim.api.nvim_open_win, buf_id, false, win_config)
+  if not ok then return nil end
+  H.cache.split_floats[float_win_id] = true
+  local winhighlight = vim.fn.escape('NormalFloat:' .. data.fill[2], ' \\|"')
+  local setlocal = 'silent! noautocmd setlocal nowrap winbar= winhighlight=' .. winhighlight
+  vim.api.nvim_win_call(float_win_id, function() vim.cmd(setlocal) end)
+  return float_win_id
+end
+
+H.get_split_line_buf = function()
+  -- Reuse buffers not shown in any window to not create new ones every time
+  for buf_id, _ in pairs(H.cache.split_line_bufs) do
+    if not vim.api.nvim_buf_is_loaded(buf_id) then
+      H.cache.split_line_bufs[buf_id] = nil
+    elseif #vim.fn.win_findbuf(buf_id) == 0 then
+      vim.api.nvim_buf_clear_namespace(buf_id, H.ns_id.split, 0, -1)
+      return buf_id
+    end
   end
-  return H.open_split_float(w, config)
+  local buf_id = vim.api.nvim_create_buf(false, true)
+  H.set_buf_name(buf_id, 'split-line')
+  H.cache.split_line_bufs[buf_id] = true
+  return buf_id
 end
 
 H.open_split_float = function(w, config)
@@ -3062,6 +3190,21 @@ H.eval_statusline = function(win_id, is_winbar, maxwidth)
     if text ~= '' then table.insert(res, { text, hl.group }) end
   end
   return #res > 0 and res or nil
+end
+
+H.truncate_cells = function(chunks, width)
+  local res = {}
+  for _, chunk in ipairs(chunks) do
+    local text, chunk_width = chunk[1], vim.fn.strdisplaywidth(chunk[1])
+    while chunk_width > width and text ~= '' do
+      text = vim.fn.strcharpart(text, 0, vim.fn.strchars(text) - 1)
+      chunk_width = vim.fn.strdisplaywidth(text)
+    end
+    if text ~= '' then table.insert(res, { text, chunk[2] }) end
+    width = width - chunk_width
+    if width <= 0 then break end
+  end
+  return res
 end
 
 H.drop_cells = function(chunks, n)
