@@ -511,15 +511,18 @@ Example:
 See |MiniAnimate.gen_subsplit| for builtin subsplit generators.
 
 Fading is controlled by `winblend` option. It is a callable which, given
-current and total step numbers, returns value of |'winblend'| of floating
-windows used for fading: `0` means content is fully hidden, `100` means it
-is fully visible. It describes open animation (so content usually becomes
-more visible with each step) and is used in reverse for close animation
-(with `n - s` instead of `s` as current step). Note, that it is called for
-current step (so starts from 0), as opposed to `timing` which is called
-before step.
+current and total step numbers, returns visibility of content in percent
+(like |'winblend'| of floating window on top of it): `0` means content is
+fully hidden, `100` means it is fully visible. It describes open animation
+(so content usually becomes more visible with each step) and is used in
+reverse for close animation (with `n - s` instead of `s` as current step).
+Note, that it is called for current step (so starts from 0), as opposed to
+`timing` which is called before step. It is called for all steps before
+animation starts. Output is rounded and clamped to be from 0 to 100; not a
+number means `100`. Close animation uses visibility rounded to 5%.
 Example:
-- Function `function(s, n) return 100 * s / n end` (default) results in
+- Function `function(s, n) return 100 * s / n end` (default, same as
+  `MiniAnimate.gen_winblend.linear({ from = 0, to = 100 })`) results in
   linear transition from fully hidden to fully visible on open (and the
   opposite on close).
 - Function `function() return 100 end` results in no fading.
@@ -541,10 +544,15 @@ Notes:
 - Fading on open uses floating windows with `zindex` 2 (see |nvim_open_win()|).
   They show nothing and use highlighting of the window's normal text
   (|hl-Normal| or |hl-NormalNC|, respecting |'winhighlight'|). It works best
-  with |'termguicolors'| enabled.
+  with |'termguicolors'| enabled. As Neovim blends floating window only
+  with regular windows, these hide floating windows with `zindex` 1 below
+  them and are not visible through transparent floating windows above.
 - Fading on close uses highlight namespaces (see |nvim_win_set_hl_ns()|) in
-  which colors of all highlight groups (except |hl-WinSeparator|) are
+  which colors of all highlight groups (except window separators) are
   blended with the window's background. It works only with |'termguicolors'|.
+- There is no fading for windows with highlight namespace set with
+  |nvim_win_set_hl_ns()| and for transparent background (no `guibg` in
+  normal highlight group) on close and, on Neovim<0.12, on open.
 - Close animation uses floating windows with `zindex` 1 (see |nvim_open_win()|)
   to be below other floating windows. They show text only of regular
   buffers (with empty |'buftype'|) which are still loaded, otherwise an
@@ -1062,8 +1070,8 @@ Generate linear `winblend` progression
 
 Parameters ~
 {opts} `(table|nil)` Options that control generator. Possible keys:
-  - <from> `(number)` - initial value of |'winblend'|.
-  - <to> `(number)` - final value of |'winblend'|.
+  - <from> `(number)` - initial value of |'winblend'|. Default: 80.
+  - <to> `(number)` - final value of |'winblend'|. Default: 100.
 
 Return ~
 `(function)` Winblend function (see |MiniAnimate.config.open|,

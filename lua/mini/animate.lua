@@ -443,15 +443,18 @@ end
 --- See |MiniAnimate.gen_subsplit| for builtin subsplit generators.
 ---
 --- Fading is controlled by `winblend` option. It is a callable which, given
---- current and total step numbers, returns value of |'winblend'| of floating
---- windows used for fading: `0` means content is fully hidden, `100` means it
---- is fully visible. It describes open animation (so content usually becomes
---- more visible with each step) and is used in reverse for close animation
---- (with `n - s` instead of `s` as current step). Note, that it is called for
---- current step (so starts from 0), as opposed to `timing` which is called
---- before step.
+--- current and total step numbers, returns visibility of content in percent
+--- (like |'winblend'| of floating window on top of it): `0` means content is
+--- fully hidden, `100` means it is fully visible. It describes open animation
+--- (so content usually becomes more visible with each step) and is used in
+--- reverse for close animation (with `n - s` instead of `s` as current step).
+--- Note, that it is called for current step (so starts from 0), as opposed to
+--- `timing` which is called before step. It is called for all steps before
+--- animation starts. Output is rounded and clamped to be from 0 to 100; not a
+--- number means `100`. Close animation uses visibility rounded to 5%.
 --- Example:
---- - Function `function(s, n) return 100 * s / n end` (default) results in
+--- - Function `function(s, n) return 100 * s / n end` (default, same as
+---   `MiniAnimate.gen_winblend.linear({ from = 0, to = 100 })`) results in
 ---   linear transition from fully hidden to fully visible on open (and the
 ---   opposite on close).
 --- - Function `function() return 100 end` results in no fading.
@@ -473,10 +476,15 @@ end
 --- - Fading on open uses floating windows with `zindex` 2 (see |nvim_open_win()|).
 ---   They show nothing and use highlighting of the window's normal text
 ---   (|hl-Normal| or |hl-NormalNC|, respecting |'winhighlight'|). It works best
----   with |'termguicolors'| enabled.
+---   with |'termguicolors'| enabled. As Neovim blends floating window only
+---   with regular windows, these hide floating windows with `zindex` 1 below
+---   them and are not visible through transparent floating windows above.
 --- - Fading on close uses highlight namespaces (see |nvim_win_set_hl_ns()|) in
----   which colors of all highlight groups (except |hl-WinSeparator|) are
+---   which colors of all highlight groups (except window separators) are
 ---   blended with the window's background. It works only with |'termguicolors'|.
+--- - There is no fading for windows with highlight namespace set with
+---   |nvim_win_set_hl_ns()| and for transparent background (no `guibg` in
+---   normal highlight group) on close and, on Neovim<0.12, on open.
 --- - Close animation uses floating windows with `zindex` 1 (see |nvim_open_win()|)
 ---   to be below other floating windows. They show text only of regular
 ---   buffers (with empty |'buftype'|) which are still loaded, otherwise an
@@ -1271,8 +1279,8 @@ MiniAnimate.gen_winblend = {}
 --- Generate linear `winblend` progression
 ---
 ---@param opts table|nil Options that control generator. Possible keys:
----   - <from> `(number)` - initial value of |'winblend'|.
----   - <to> `(number)` - final value of |'winblend'|.
+---   - <from> `(number)` - initial value of |'winblend'|. Default: 80.
+---   - <to> `(number)` - final value of |'winblend'|. Default: 100.
 ---
 ---@return function Winblend function (see |MiniAnimate.config.open|,
 ---   |MiniAnimate.config.close|, or |MiniAnimate.config.split|).
@@ -1371,6 +1379,8 @@ H.cache = {
   -- options which should be restored before closing floating windows.
   split_floats = {},
   split_float_restore = {},
+  split_float_winhighlight = {},
+  split_float_ns = {},
   split_line_bufs = {},
   -- Callable to immediately finish current animation
   split_finish = nil,
@@ -1380,7 +1390,7 @@ H.cache = {
 
   -- Data for fading with highlight namespaces: highlight group definitions,
   -- created namespaces, and identifier of definitions
-  fade = { id = 0, defs = {}, ns = {} },
+  fade = { id = 0, defs = {}, ns = {}, n_ns = 0 },
 }
 
 -- Namespaces for module operations
@@ -2311,6 +2321,14 @@ H.make_split_open_step = function(data, opts)
   end
   local curtains, curtain_wins = {}, H.get_layout_windows(second)
   local update_curtains = function(step)
+    -- Show only in animated tabpage
+    if vim.api.nvim_get_current_tabpage() ~= tabpage_id then
+      for id, curtain in pairs(curtains) do
+        if curtain then H.close_split_floats(curtain) end
+        curtains[id] = curtain == false and false or nil
+      end
+      return
+    end
     for _, id in ipairs(curtain_wins) do
       local pos, width, height =
         vim.api.nvim_win_get_position(id), vim.api.nvim_win_get_width(id), vim.api.nvim_win_get_height(id)
@@ -2325,7 +2343,7 @@ H.make_split_open_step = function(data, opts)
         vim.api.nvim_win_set_config(curtains[id], config)
       elseif curtains[id] == nil and is_visible then
         local normal_hl = H.get_normal_hl(vim.wo[id].winhighlight, id == vim.api.nvim_get_current_win())
-        curtains[id] = H.open_split_curtain(config, normal_hl)
+        if H.can_fade_curtain(id, normal_hl) then curtains[id] = H.open_split_curtain(config, normal_hl) end
       end
       if curtains[id] then H.set_winblend_silently(curtains[id], blends[step]) end
     end
@@ -2499,6 +2517,7 @@ H.get_split_snapshot = function()
       matches = vim.fn.getmatches(win_id),
       winhighlight = opts.winhighlight or '',
       hl_map = H.parse_winhighlight(opts.winhighlight or ''),
+      hl_ns = H.get_win_hl_ns(win_id),
       fillchars = vim.api.nvim_win_call(win_id, H.get_fillchars),
       is_current = win_id == cur_win_id,
       -- Text area data
@@ -2561,6 +2580,15 @@ end
 -- Window options which should not be copied to floating windows as they
 -- affect other windows
 H.split_float_ignore_options = { diff = true, previewwindow = true }
+
+-- Get highlight namespace set for window with |nvim_win_set_hl_ns()|. It is
+-- also reported for 'winhighlight' (implemented with namespace), so only
+-- detect it if there is no 'winhighlight'.
+H.get_win_hl_ns = function(win_id)
+  local ok, ns = pcall(vim.api.nvim_get_hl_ns, { winid = win_id })
+  if not ok or ns <= 0 or vim.wo[win_id].winhighlight ~= '' then return nil end
+  return ns
+end
 
 -- Get 'fillchars' of current window. Empty local value means global one.
 H.get_fillchars = function()
@@ -2864,10 +2892,22 @@ H.draw_split_floats = function(floats, w, r, size, visibility)
     end
   end
 
-  -- Fade content by using faded colors
-  local fade_ns = H.get_fade_ns(H.get_normal_hl(w.winhighlight, w.is_current), visibility)
+  -- Fade content (text and winbar) by using faded colors. Set namespace only
+  -- when fading is needed, as it overrides 'winhighlight' and can't be unset.
+  if w.hl_ns ~= nil then return true end
+  local normal_hl = H.get_normal_hl(w.winhighlight, w.is_current)
+  local keep = { w.left_border[2], w.vert_border[2], r.line_border[2] }
   for _, name in ipairs({ 'text', 'winbar' }) do
-    if floats[name] ~= nil then vim.api.nvim_win_set_hl_ns(floats[name], fade_ns) end
+    local float_win_id = floats[name]
+    local cur_ns = H.cache.split_float_ns[float_win_id]
+    if float_win_id ~= nil and (visibility < 100 or cur_ns ~= nil) then
+      local winhighlight = H.cache.split_float_winhighlight[float_win_id] or ''
+      local ns = H.get_fade_ns(winhighlight, normal_hl, keep, visibility)
+      if ns ~= nil and ns ~= cur_ns then
+        vim.api.nvim_win_set_hl_ns(float_win_id, ns)
+        H.cache.split_float_ns[float_win_id] = ns
+      end
+    end
   end
   return true
 end
@@ -2951,6 +2991,7 @@ H.open_split_line_float = function(config)
   local ok, float_win_id = pcall(vim.api.nvim_open_win, buf_id, false, win_config)
   if not ok then return nil end
   H.cache.split_floats[float_win_id] = true
+  H.cache.split_float_winhighlight[float_win_id] = 'NormalFloat:Normal'
   -- Use neutral base highlighting as every cell has its own
   local setlocal = 'silent! noautocmd setlocal nowrap winbar= winblend=0 winhighlight=NormalFloat:Normal'
   if H.has_eventignorewin then setlocal = setlocal .. ' eventignorewin=all' end
@@ -2968,8 +3009,7 @@ H.get_split_line_buf = function()
       return buf_id
     end
   end
-  local buf_id = vim.api.nvim_create_buf(false, true)
-  H.set_buf_name(buf_id, 'split-line')
+  local buf_id = H.create_scratch_buf('split-line')
   H.cache.split_line_bufs[buf_id] = true
   return buf_id
 end
@@ -3021,6 +3061,9 @@ H.open_split_float = function(w, config)
     pcall(vim.fn.setmatches, w.matches)
     pcall(vim.fn.winrestview, w.view)
   end)
+  H.cache.split_float_winhighlight[float_win_id] = winhighlight
+  -- Imitate highlight namespace of window (it overrides 'winhighlight')
+  if w.hl_ns ~= nil then vim.api.nvim_win_set_hl_ns(float_win_id, w.hl_ns) end
 
   -- Restore options before closing as they are saved for the buffer and
   -- are used in the next window showing it
@@ -3076,6 +3119,15 @@ H.imitate_folds = function(w)
   vim.v.errmsg = errmsg
 end
 
+-- Whether window can be faded with empty floating window on top of it: its
+-- highlighting can be imitated and its background is not transparent (on
+-- Neovim<0.12 transparent background becomes black during blending)
+H.can_fade_curtain = function(win_id, normal_hl)
+  if H.get_win_hl_ns(win_id) ~= nil then return false end
+  local has_bg = vim.api.nvim_get_hl(0, { name = normal_hl, link = false }).bg ~= nil
+  return has_bg or vim.fn.has('nvim-0.12') == 1
+end
+
 -- Open empty floating window used to fade content below it
 H.open_split_curtain = function(config, normal_hl)
   H.ensure_empty_buf()
@@ -3083,7 +3135,11 @@ H.open_split_curtain = function(config, normal_hl)
   local ok, float_win_id = pcall(vim.api.nvim_open_win, H.empty_buf_id, false, vim.tbl_extend('force', config, extra))
   if not ok then return nil end
   H.cache.split_floats[float_win_id] = true
-  local setlocal = 'silent! noautocmd setlocal winhighlight=NormalFloat:' .. vim.fn.escape(normal_hl, ' \\|"')
+  -- Show only background (without highlighting of buffer's empty line)
+  local hl = vim.fn.escape(normal_hl, ' \\|"')
+  local winhighlight =
+    string.format('NormalFloat:%s,EndOfBuffer:%s,Search:%s,CurSearch:%s,IncSearch:%s', hl, hl, hl, hl, hl)
+  local setlocal = 'silent! noautocmd setlocal winhighlight=' .. winhighlight
   if H.has_eventignorewin then setlocal = setlocal .. ' eventignorewin=all' end
   vim.api.nvim_win_call(float_win_id, function() vim.cmd(setlocal) end)
   return float_win_id
@@ -3097,48 +3153,82 @@ end
 H.get_split_winblends = function(winblend, n_steps)
   local res = {}
   for step = 0, n_steps do
-    local value = tonumber(winblend(step, n_steps)) or 100
+    local value = tonumber((winblend(step, n_steps)))
+    -- Not a number (including NaN) means no fading
+    if value == nil or value ~= value then value = 100 end
     res[step] = H.round(math.min(math.max(value, 0), 100))
   end
   return res
 end
 
--- Get highlight namespace in which all highlight groups (except separators)
--- look faded towards background of `normal_hl` to have `visibility` percent
--- of visibility. Namespaces are cached per 5% of visibility.
-H.get_fade_ns = function(normal_hl, visibility)
-  visibility = 5 * H.round(visibility / 5)
-  if not vim.o.termguicolors or visibility >= 100 then return 0 end
+-- Get highlight namespace which imitates highlighting of floating window with
+-- 'winhighlight' `winhighlight` (namespace overrides it) with content faded
+-- towards background of `normal_hl` to have `visibility` percent of
+-- visibility. Groups `keep` are not faded. Return `nil` if fading is not
+-- possible. Namespaces are cached per 5% of visibility and are redefined if
+-- highlight groups change.
+H.get_fade_ns = function(winhighlight, normal_hl, keep, visibility)
+  if not vim.o.termguicolors then return nil end
+  local cache, defs = H.cache.fade, H.cache.fade.defs
+  local normal = defs[normal_hl] or defs.Normal or {}
+  if normal.bg == nil then return nil end
 
-  local cache = H.cache.fade
-  local name = string.format('MiniAnimateFade_%d_%s_%d', cache.id, normal_hl, visibility)
-  if cache.ns[name] ~= nil then return cache.ns[name] end
-
-  local defs, dark = cache.defs, vim.o.background == 'dark'
-  local normal = vim.tbl_extend('force', defs.Normal or {}, defs[normal_hl] or {})
-  local bg, fg = normal.bg or (dark and 0x000000 or 0xffffff), normal.fg or (dark and 0xffffff or 0x000000)
-  local coef = 1 - visibility / 100
-  local ns = vim.api.nvim_create_namespace(name)
-  for group, def in pairs(defs) do
-    if not H.fade_ignore_groups[group] then
-      local new = vim.deepcopy(def)
-      new.link, new.default = nil, nil
-      new.fg = def.fg and H.blend_rgb(def.fg, bg, coef)
-      new.bg = def.bg and H.blend_rgb(def.bg, bg, coef)
-      new.sp = def.sp and H.blend_rgb(def.sp, bg, coef)
-      pcall(vim.api.nvim_set_hl, ns, group, new)
-    end
+  visibility = math.min(math.max(5 * H.round(visibility / 5), 0), 100)
+  keep = vim.fn.sort(vim.fn.uniq(vim.fn.sort(vim.deepcopy(keep))))
+  local key = table.concat({ winhighlight, normal_hl, table.concat(keep, ','), visibility }, '|')
+  local data = cache.ns[key]
+  if data == nil then
+    cache.n_ns = cache.n_ns + 1
+    local ns = vim.api.nvim_create_namespace(string.format('MiniAnimateFade_%d_%d', cache.n_ns, visibility))
+    data = { ns = ns, defs_id = -1, groups = {} }
+    cache.ns[key] = data
   end
-  -- Normal text should always be faded
-  local new_normal = vim.tbl_extend('force', defs[normal_hl] or {}, { fg = H.blend_rgb(fg, bg, coef), bg = bg })
-  new_normal.link, new_normal.default = nil, nil
-  pcall(vim.api.nvim_set_hl, ns, normal_hl, new_normal)
+  if data.defs_id == cache.id then return data.ns end
 
-  cache.ns[name] = ns
-  return ns
+  local bg, coef = normal.bg, 1 - visibility / 100
+  local dark = vim.o.background == 'dark'
+  local fade = function(def, is_normal)
+    local res = vim.deepcopy(def)
+    res.link, res.default = nil, nil
+    if is_normal then
+      res.fg, res.bg = res.fg or normal.fg or (dark and 0xffffff or 0x000000), res.bg or bg
+    end
+    res.fg = res.fg and H.blend_rgb(res.fg, bg, coef)
+    res.bg = res.bg and H.blend_rgb(res.bg, bg, coef)
+    res.sp = res.sp and H.blend_rgb(res.sp, bg, coef)
+    return res
+  end
+  local groups = {}
+  local set = function(name, def)
+    pcall(vim.api.nvim_set_hl, data.ns, name, def)
+    groups[name] = true
+  end
+
+  for name, def in pairs(defs) do
+    set(name, fade(def))
+  end
+  -- Imitate 'winhighlight'. Normal text in floating window uses 'NormalFloat'
+  -- and 'NormalNC' (as it is never current).
+  local hl_map = H.parse_winhighlight(winhighlight)
+  hl_map.NormalFloat, hl_map.NormalNC =
+    hl_map.NormalFloat or normal_hl, hl_map.NormalNC or hl_map.NormalFloat or normal_hl
+  for from, to in pairs(hl_map) do
+    set(from, fade(defs[to] or {}, from == 'NormalFloat' or from == 'NormalNC'))
+  end
+  -- Keep some groups (like separators) not faded
+  for _, name in ipairs(keep) do
+    local def = vim.deepcopy(defs[name] or {})
+    def.link, def.default = nil, nil
+    set(name, def)
+  end
+  -- Clear groups which are not defined anymore
+  for name, _ in pairs(data.groups) do
+    if not groups[name] then pcall(vim.api.nvim_set_hl, data.ns, name, {}) end
+  end
+
+  data.groups, data.defs_id = groups, cache.id
+  return data.ns
 end
-
-H.fade_ignore_groups = { WinSeparator = true, VertSplit = true }
 
 -- Update definitions of highlight groups used to compute faded colors
 H.update_fade_cache = function()
@@ -3154,7 +3244,7 @@ H.update_fade_cache = function()
     defs[name] = def
   end
   if vim.deep_equal(defs, H.cache.fade.defs) then return end
-  H.cache.fade = { id = H.cache.fade.id + 1, defs = defs, ns = {} }
+  H.cache.fade.id, H.cache.fade.defs = H.cache.fade.id + 1, defs
 end
 
 -- Blend two RGB colors: 0 - first one, 1 - second one
@@ -3168,19 +3258,19 @@ H.blend_rgb = function(a, b, coef)
 end
 
 -- Get highlight group which imitates normal text of window. Not current
--- window uses 'NormalNC' (if it is set).
+-- window uses 'NormalNC' (if it is set and there is no other normal group).
 H.get_normal_hl = function(winhighlight, is_current)
-  local normal_hl = (',' .. winhighlight):match(',Normal:([^,]+)') or 'Normal'
-  if is_current then return normal_hl end
-  local normalnc_hl = (',' .. winhighlight):match(',NormalNC:([^,]+)')
-  if normalnc_hl ~= nil then return normalnc_hl end
-  return next(vim.api.nvim_get_hl(0, { name = 'NormalNC' })) ~= nil and 'NormalNC' or normal_hl
+  local hl_map = H.parse_winhighlight(winhighlight)
+  if is_current then return hl_map.Normal or 'Normal' end
+  if hl_map.NormalNC ~= nil or hl_map.Normal ~= nil then return hl_map.NormalNC or hl_map.Normal end
+  return next(vim.api.nvim_get_hl(0, { name = 'NormalNC' })) ~= nil and 'NormalNC' or 'Normal'
 end
 
 H.close_split_floats = function(win_id)
   local win_ids = win_id == nil and vim.tbl_keys(H.cache.split_floats) or { win_id }
   for _, id in ipairs(win_ids) do
     H.cache.split_floats[id] = nil
+    H.cache.split_float_winhighlight[id], H.cache.split_float_ns[id] = nil, nil
     local is_valid = vim.api.nvim_win_is_valid(id)
     if not is_valid then H.cache.split_float_restore[id] = nil end
     if is_valid then
@@ -3203,8 +3293,7 @@ H.ensure_empty_buf = function()
   -- Empty buffer should always be valid (might have been closed by user command)
   if H.empty_buf_id ~= nil and vim.api.nvim_buf_is_loaded(H.empty_buf_id) then return end
   pcall(vim.api.nvim_buf_delete, H.empty_buf_id, { force = true })
-  H.empty_buf_id = vim.api.nvim_create_buf(false, true)
-  H.set_buf_name(H.empty_buf_id, 'open-close-scratch')
+  H.empty_buf_id = H.create_scratch_buf('open-close-scratch')
 end
 
 H.start_split = function(finish)
@@ -3623,6 +3712,24 @@ H.exec_normal = function(command)
   H.cache.is_executing_normal = true
   local ok, err = pcall(vim.cmd, command)
   H.cache.is_executing_normal = false
+  if not ok then error(err, 0) end
+end
+
+-- Create scratch buffer without triggering events
+H.create_scratch_buf = function(name)
+  local buf_id
+  H.call_noautocmd(function()
+    buf_id = vim.api.nvim_create_buf(false, true)
+    H.set_buf_name(buf_id, name)
+  end)
+  return buf_id
+end
+
+-- Call function without triggering events
+H.call_noautocmd = function(f)
+  _G.__minianimate_noautocmd = f
+  local ok, err = pcall(vim.cmd, 'noautocmd lua _G.__minianimate_noautocmd()')
+  _G.__minianimate_noautocmd = nil
   if not ok then error(err, 0) end
 end
 
