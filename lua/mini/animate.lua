@@ -2195,9 +2195,7 @@ H.make_split_open_step = function(data, opts)
     track_moved()
     H.set_win_sizes(sizes_to, dim, ordered_wins)
     for _, id in ipairs(pair_wins) do
-      if not is_moved[id] then
-        vim.api.nvim_win_call(id, function() vim.fn.winrestview(state_to.views[id]) end)
-      end
+      if not is_moved[id] then vim.api.nvim_win_call(id, function() vim.fn.winrestview(state_to.views[id]) end) end
     end
   end
 
