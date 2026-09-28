@@ -1699,7 +1699,9 @@ H.on_key = function()
   if finish == nil then return end
   H.cache.split_event_id = H.cache.split_event_id + 1
   pcall(finish)
-  H.stop_split()
+  -- Don't error inside key listener as it will be removed. Show it later.
+  local ok, err = pcall(H.stop_split)
+  if not ok then vim.schedule(function() error(err, 0) end) end
 end
 
 -- General animation ----------------------------------------------------------
@@ -2168,11 +2170,16 @@ H.make_split_open_step = function(data, opts)
   -- Track state after every step to stop if changed not by animation and to
   -- restore views at the end only if there was no cursor movement (like
   -- from other scripts, as it might be scrolled because of resize)
-  local last_sizes, cursors = {}, {}
+  local last_sizes, cursors, is_moved = {}, {}, {}
   local track_state = function()
     last_sizes = get_sizes(pair_wins)
     for _, id in ipairs(pair_wins) do
       cursors[id] = vim.api.nvim_win_get_cursor(id)
+    end
+  end
+  local track_moved = function()
+    for _, id in ipairs(pair_wins) do
+      is_moved[id] = is_moved[id] or not vim.deep_equal(cursors[id], vim.api.nvim_win_get_cursor(id))
     end
   end
   track_state()
@@ -2185,9 +2192,10 @@ H.make_split_open_step = function(data, opts)
 
   local finish = function()
     if not is_same_layout() then return end
+    track_moved()
     H.set_win_sizes(sizes_to, dim, ordered_wins)
     for _, id in ipairs(pair_wins) do
-      if vim.deep_equal(cursors[id], vim.api.nvim_win_get_cursor(id)) then
+      if not is_moved[id] then
         vim.api.nvim_win_call(id, function() vim.fn.winrestview(state_to.views[id]) end)
       end
     end
@@ -2209,6 +2217,7 @@ H.make_split_open_step = function(data, opts)
 
       -- Perform animation. Ensure that only pair windows are affected (as it
       -- is not always the case, like with windows of fixed size).
+      track_moved()
       local ok_step = pcall(apply_step, step_sizes[step])
       if not (ok_step and H.is_resize_state_kept(state_to, pair_wins)) then
         restore_final()
@@ -2354,6 +2363,8 @@ H.eval_split_lines = function(w)
   local has_statusline = vim.o.laststatus ~= 3 and w.bottom > w.text_top + w.height - 1
   w.statusline = has_statusline and H.eval_statusline(w.win_id, false, w.width) or nil
   w.winbar_line = w.winbar == 1 and H.eval_statusline(w.win_id, true, w.width) or nil
+  -- Track if window is current during evaluation to use consistent highlight
+  w.is_current = w.win_id == vim.api.nvim_get_current_win()
   w.is_evaluated = true
 end
 
@@ -2418,17 +2429,7 @@ H.get_split_close_regions = function(snapshot)
   process(snapshot.layout)
 
   -- Precompute how floating window borders look: separators, status lines
-  local get_horiz_border = function(w)
-    -- Use actual current window for windows which are not imitated
-    local is_current = w.is_current
-    if w.region == nil and vim.api.nvim_win_is_valid(w.win_id) then is_current = w.win_id == cur_win_id end
-    return H.get_split_border_char(snapshot, 'horiz', is_current)
-  end
-  for _, r in ipairs(regions) do
-    for _, w in ipairs(r.wins) do
-      w.region = r
-    end
-  end
+  local get_horiz_border = function(w) return H.get_split_border_char(snapshot, 'horiz', w.is_current) end
   for _, r in ipairs(regions) do
     for _, w in ipairs(r.wins) do
       w.vert_border = H.get_split_border_char(snapshot, 'vert')
@@ -2443,7 +2444,7 @@ H.get_split_close_regions = function(snapshot)
 
       -- Horizontal split line can be status lines of windows above it
       if r.dim == 'height' and w.top == r.from + 1 and snapshot.laststatus ~= 3 then
-        w.line_statusline = H.get_split_line_statusline(wins, w, r.from)
+        w.line_statusline = H.get_split_line_statusline(snapshot, w, r.from)
       end
     end
   end
@@ -2460,10 +2461,10 @@ H.get_split_border_char = function(snapshot, type, is_current)
 end
 
 -- Combine status lines of windows above window `w` with status line at `row`
-H.get_split_line_statusline = function(wins, w, row)
+H.get_split_line_statusline = function(snapshot, w, row)
   local aboves = vim.tbl_filter(
     function(above) return above.bottom == row and above.left <= w.right and w.left <= above.right end,
-    vim.tbl_values(wins)
+    vim.tbl_values(snapshot.wins)
   )
   if #aboves == 0 then return nil end
   table.sort(aboves, function(a, b) return a.left < b.left end)
@@ -2473,12 +2474,12 @@ H.get_split_line_statusline = function(wins, w, row)
     -- Each status line should span whole frame width (with separator)
     local statusline = above.statusline or {}
     local width = above.right - above.left + 1
-    local fill_hl = (statusline[1] or {})[2] or (above.is_current and 'StatusLine' or 'StatusLineNC')
+    local fill = H.get_split_border_char(snapshot, 'horiz', above.is_current)
     for _, chunk in ipairs(statusline) do
       table.insert(res, chunk)
       width = width - vim.fn.strdisplaywidth(chunk[1])
     end
-    if width > 0 then table.insert(res, { string.rep(' ', width), fill_hl }) end
+    if width > 0 then table.insert(res, { string.rep(fill[1], width), (statusline[1] or fill)[2] }) end
   end
   return H.drop_cells(res, w.left - aboves[1].left)
 end
@@ -2608,14 +2609,13 @@ H.close_split_floats = function(win_id)
   for _, id in ipairs(win_ids) do
     H.cache.split_floats[id] = nil
     if vim.api.nvim_win_is_valid(id) then
-      -- Close silently if buffer stays loaded (to not trigger events for
-      -- something that is already done), otherwise let it be done properly
+      -- Hide buffer (to not unload it due to 'hidden'). Do it silently if
+      -- buffer stays loaded (to not trigger events for something already
+      -- done), otherwise let it be done properly (like due to 'bufhidden').
       local buf_id = vim.api.nvim_win_get_buf(id)
       local bufhidden = vim.bo[buf_id].bufhidden
-      local is_shown_elsewhere = #vim.fn.win_findbuf(buf_id) > 1
-      local stays_loaded = is_shown_elsewhere or bufhidden == 'hide' or (bufhidden == '' and vim.o.hidden)
-      local cmd = string.format('%scall nvim_win_close(%d, v:true)', stays_loaded and 'noautocmd ' or '', id)
-      pcall(vim.cmd, cmd)
+      local stays_loaded = #vim.fn.win_findbuf(buf_id) > 1 or bufhidden == '' or bufhidden == 'hide'
+      pcall(vim.cmd, string.format('%scall nvim_win_hide(%d)', stays_loaded and 'noautocmd ' or '', id))
     end
   end
 end
@@ -3051,10 +3051,11 @@ H.eval_statusline = function(win_id, is_winbar, maxwidth)
   -- `pcall`) which can abort current command
   local opts = { winid = win_id, highlights = true, use_winbar = is_winbar, maxwidth = maxwidth }
   local cmd = 'silent! let g:minianimate_statusline = nvim_eval_statusline(%s, %s)'
+  local errmsg = vim.v.errmsg
   vim.g.minianimate_statusline = nil
   pcall(vim.cmd, string.format(cmd, vim.fn.string(statusline), vim.fn.string(opts)))
   local data = vim.g.minianimate_statusline
-  vim.g.minianimate_statusline = nil
+  vim.g.minianimate_statusline, vim.v.errmsg = nil, errmsg
   if type(data) ~= 'table' then return nil end
 
   local res, highlights = {}, data.highlights
