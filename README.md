@@ -33,7 +33,7 @@ https://user-images.githubusercontent.com/24854248/215829092-5aba4e8d-94a5-43da-
 - Animate **scrolling** with a series of subscrolls ("smooth scrolling").
 - Animate **window resize** by gradually changing sizes of all windows.
 - Animate **window open/close** with visually updating floating window.
-- Animate **split window open/close** by moving split line from/to right or bottom edge.
+- Animate **split window open/close** by moving split line from/to right or bottom edge while fading windows in/out.
 - Timings for all actions can be customized independently.
 - Action animations can be enabled/disabled independently.
 - All animations are asynchronous/non-blocking and trigger a targeted event which can be used to perform actions after animation is done.
@@ -215,6 +215,9 @@ Stable branch:
 
     -- Subsplit generator for all steps of split line movement
     subsplit = --<function: implements equal steps with at most 60 steps>,
+
+    -- 'winblend' (window transparency) generator for fading windows
+    winblend = --<function: implements equal linear steps from 0 to 100>,
   },
 }
 ```

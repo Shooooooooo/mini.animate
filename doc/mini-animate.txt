@@ -21,7 +21,8 @@ Features:
   See |MiniAnimate.config.open| and |MiniAnimate.config.close| for more details.
 
 - Animate split window open/close by moving split line from/to right or
-  bottom edge. See |MiniAnimate.config.split| for more details.
+  bottom edge while fading windows in/out.
+  See |MiniAnimate.config.split| for more details.
 
 - Timings for all actions can be customized independently.
   See |MiniAnimate-timing| for more details.
@@ -194,6 +195,9 @@ Defaults ~
 
       -- Subsplit generator for all steps of split line movement
       subsplit = --<function: implements equal steps with at most 60 steps>,
+
+      -- 'winblend' (window transparency) generator for fading windows
+      winblend = --<function: implements equal linear steps from 0 to 100>,
     },
   }
 <
@@ -482,6 +486,10 @@ Its visualization is a moving split line (window separator or status line):
   lines, winbars) is imitated with floating windows. They are shown over
   the actual final layout and are gradually squeezed out.
 
+In addition to that, content (text and winbar) of windows after the split
+line fades in on open and fades out on close. It is done with empty
+floating windows on top of this content which change their transparency.
+
 Exact split line positions and their number is controlled by `subsplit`
 option. It is a callable which takes `size_from` and `size_to` arguments
 (both non-negative integers) and returns array of sizes for every step.
@@ -501,6 +509,22 @@ Example:
 
 See |MiniAnimate.gen_subsplit| for builtin subsplit generators.
 
+Fading is controlled by `winblend` option. It is a callable which, given
+current and total step numbers, returns value of |'winblend'| of floating
+windows used for fading: `0` means content is fully hidden, `100` means it
+is fully visible. It describes open animation (so content usually becomes
+more visible with each step) and is used in reverse for close animation
+(with `n - s` instead of `s` as current step). Note, that it is called for
+current step (so starts from 0), as opposed to `timing` which is called
+before step.
+Example:
+- Function `function(s, n) return 100 * s / n end` (default) results in
+  linear transition from fully hidden to fully visible on open (and the
+  opposite on close).
+- Function `function() return 100 end` results in no fading.
+
+See |MiniAnimate.gen_winblend| for builtin window transparency generators.
+
 Notes:
 - Any key press during animation finishes it immediately. This way the key
   is always executed with the final layout (like navigating to or resizing
@@ -513,6 +537,10 @@ Notes:
 - Open animation moves only the split line between new window and the one
   it was split from. If other windows are resized as a result of a split
   (like due to |'equalalways'|), they get their final sizes immediately.
+- Fading uses floating windows with `zindex` 2 (see |nvim_open_win()|).
+  They show nothing and use highlighting of the window's normal text
+  (|hl-Normal| or |hl-NormalNC|, respecting |'winhighlight'|). Fading works
+  best with |'termguicolors'| enabled.
 - Close animation uses floating windows with `zindex` 1 (see |nvim_open_win()|)
   to be below other floating windows. They show text only of regular
   buffers (with empty |'buftype'|) which are still loaded, otherwise an
@@ -534,6 +562,9 @@ Configuration example: >lua
 
       -- Animate with at most 30 steps
       subsplit = animate.gen_subsplit.equal({ max_output_steps = 30 }),
+
+      -- Fade only slightly
+      winblend = animate.gen_winblend.linear({ from = 60, to = 100 }),
     },
   })
 <
@@ -996,9 +1027,10 @@ Return ~
 ------------------------------------------------------------------------------
                                                       *MiniAnimate.gen_winblend*
                            `MiniAnimate.gen_winblend`
-Generate open/close animation `winblend` progression
+Generate open/close/split animation `winblend` progression
 
-For more information see |MiniAnimate.config.open| or |MiniAnimate.config.close|.
+For more information see |MiniAnimate.config.open|, |MiniAnimate.config.close|,
+or |MiniAnimate.config.split|.
 
 This is a table with function elements. Call to actually get transparency
 function.
@@ -1028,8 +1060,8 @@ Parameters ~
   - <to> `(number)` - final value of |'winblend'|.
 
 Return ~
-`(function)` Winblend function (see |MiniAnimate.config.open|
-  or |MiniAnimate.config.close|).
+`(function)` Winblend function (see |MiniAnimate.config.open|,
+  |MiniAnimate.config.close|, or |MiniAnimate.config.split|).
 
 ------------------------------------------------------------------------------
                                                       *MiniAnimate.gen_subsplit*

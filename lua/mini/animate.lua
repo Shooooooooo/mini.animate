@@ -19,7 +19,8 @@
 ---   See |MiniAnimate.config.open| and |MiniAnimate.config.close| for more details.
 ---
 --- - Animate split window open/close by moving split line from/to right or
----   bottom edge. See |MiniAnimate.config.split| for more details.
+---   bottom edge while fading windows in/out.
+---   See |MiniAnimate.config.split| for more details.
 ---
 --- - Timings for all actions can be customized independently.
 ---   See |MiniAnimate-timing| for more details.
@@ -417,6 +418,10 @@ end
 ---   lines, winbars) is imitated with floating windows. They are shown over
 ---   the actual final layout and are gradually squeezed out.
 ---
+--- In addition to that, content (text and winbar) of windows after the split
+--- line fades in on open and fades out on close. It is done with empty
+--- floating windows on top of this content which change their transparency.
+---
 --- Exact split line positions and their number is controlled by `subsplit`
 --- option. It is a callable which takes `size_from` and `size_to` arguments
 --- (both non-negative integers) and returns array of sizes for every step.
@@ -436,6 +441,22 @@ end
 ---
 --- See |MiniAnimate.gen_subsplit| for builtin subsplit generators.
 ---
+--- Fading is controlled by `winblend` option. It is a callable which, given
+--- current and total step numbers, returns value of |'winblend'| of floating
+--- windows used for fading: `0` means content is fully hidden, `100` means it
+--- is fully visible. It describes open animation (so content usually becomes
+--- more visible with each step) and is used in reverse for close animation
+--- (with `n - s` instead of `s` as current step). Note, that it is called for
+--- current step (so starts from 0), as opposed to `timing` which is called
+--- before step.
+--- Example:
+--- - Function `function(s, n) return 100 * s / n end` (default) results in
+---   linear transition from fully hidden to fully visible on open (and the
+---   opposite on close).
+--- - Function `function() return 100 end` results in no fading.
+---
+--- See |MiniAnimate.gen_winblend| for builtin window transparency generators.
+---
 --- Notes:
 --- - Any key press during animation finishes it immediately. This way the key
 ---   is always executed with the final layout (like navigating to or resizing
@@ -448,6 +469,10 @@ end
 --- - Open animation moves only the split line between new window and the one
 ---   it was split from. If other windows are resized as a result of a split
 ---   (like due to |'equalalways'|), they get their final sizes immediately.
+--- - Fading uses floating windows with `zindex` 2 (see |nvim_open_win()|).
+---   They show nothing and use highlighting of the window's normal text
+---   (|hl-Normal| or |hl-NormalNC|, respecting |'winhighlight'|). Fading works
+---   best with |'termguicolors'| enabled.
 --- - Close animation uses floating windows with `zindex` 1 (see |nvim_open_win()|)
 ---   to be below other floating windows. They show text only of regular
 ---   buffers (with empty |'buftype'|) which are still loaded, otherwise an
@@ -469,6 +494,9 @@ end
 ---
 ---       -- Animate with at most 30 steps
 ---       subsplit = animate.gen_subsplit.equal({ max_output_steps = 30 }),
+---
+---       -- Fade only slightly
+---       winblend = animate.gen_winblend.linear({ from = 60, to = 100 }),
 ---     },
 ---   })
 --- <
@@ -589,6 +617,11 @@ MiniAnimate.config = {
     subsplit = function(size_from, size_to)
       return H.subsplit_equal(size_from, size_to, { predicate = H.default_subsplit_predicate, max_output_steps = 60 })
     end,
+    --minidoc_replace_end
+
+    -- 'winblend' (window transparency) generator for fading windows
+    --minidoc_replace_start winblend = --<function: implements equal linear steps from 0 to 100>,
+    winblend = function(s, n) return 100 * (s / n) end,
     --minidoc_replace_end
   },
 }
@@ -1205,9 +1238,10 @@ MiniAnimate.gen_winconfig.wipe = function(opts)
   end
 end
 
---- Generate open/close animation `winblend` progression
+--- Generate open/close/split animation `winblend` progression
 ---
---- For more information see |MiniAnimate.config.open| or |MiniAnimate.config.close|.
+--- For more information see |MiniAnimate.config.open|, |MiniAnimate.config.close|,
+--- or |MiniAnimate.config.split|.
 ---
 --- This is a table with function elements. Call to actually get transparency
 --- function.
@@ -1234,8 +1268,8 @@ MiniAnimate.gen_winblend = {}
 ---   - <from> `(number)` - initial value of |'winblend'|.
 ---   - <to> `(number)` - final value of |'winblend'|.
 ---
----@return function Winblend function (see |MiniAnimate.config.open|
----   or |MiniAnimate.config.close|).
+---@return function Winblend function (see |MiniAnimate.config.open|,
+---   |MiniAnimate.config.close|, or |MiniAnimate.config.split|).
 MiniAnimate.gen_winblend.linear = function(opts)
   opts = opts or {}
   local from = opts.from or 80
@@ -1394,6 +1428,7 @@ H.setup_config = function(config)
   H.check_type('split.enable', config.split.enable, 'boolean')
   H.check_type('split.timing', config.split.timing, 'callable')
   H.check_type('split.subsplit', config.split.subsplit, 'callable')
+  H.check_type('split.winblend', config.split.winblend, 'callable')
 
   return config
 end
@@ -2248,7 +2283,50 @@ H.make_split_open_step = function(data, opts)
     end
   end
 
-  local event_id, timing, n_steps = H.cache.split_event_id, opts.timing, #step_sizes
+  -- Fade in content after split line (appearing windows) with floating
+  -- windows on top of them which are gradually becoming transparent
+  local n_steps = #step_sizes
+  local ok_blend, blends = pcall(H.get_split_winblends, opts.winblend, n_steps)
+  if not ok_blend then
+    restore_final()
+    error(blends, 0)
+  end
+  local curtains, curtain_wins = {}, H.get_layout_windows(second)
+  local update_curtains = function(step)
+    for _, id in ipairs(curtain_wins) do
+      local pos, width, height =
+        vim.api.nvim_win_get_position(id), vim.api.nvim_win_get_width(id), vim.api.nvim_win_get_height(id)
+      local config = { relative = 'editor', row = pos[1], col = pos[2], width = width, height = height }
+      local is_visible = blends[step] < 100 and width > 0 and height > 0
+      -- Don't reopen if closed not by animation
+      if curtains[id] ~= nil and not vim.api.nvim_win_is_valid(curtains[id]) then curtains[id] = false end
+      if curtains[id] and not is_visible then
+        H.close_split_floats(curtains[id])
+        curtains[id] = nil
+      elseif curtains[id] and is_visible then
+        vim.api.nvim_win_set_config(curtains[id], config)
+      elseif curtains[id] == nil and is_visible then
+        local normal_hl = H.get_normal_hl(vim.wo[id].winhighlight, id == vim.api.nvim_get_current_win())
+        curtains[id] = H.open_split_curtain(config, normal_hl)
+      end
+      if curtains[id] then H.set_winblend_silently(curtains[id], blends[step]) end
+    end
+  end
+  local close_curtains = function()
+    for _, curtain in pairs(curtains) do
+      if curtain then H.close_split_floats(curtain) end
+    end
+    curtains = {}
+  end
+  update_curtains(0)
+
+  local finish_resize = finish
+  finish = function()
+    close_curtains()
+    finish_resize()
+  end
+
+  local event_id, timing = H.cache.split_event_id, opts.timing
   return {
     step_action = function(step)
       -- Do nothing on initialization (split line is already at the edge)
@@ -2256,11 +2334,17 @@ H.make_split_open_step = function(data, opts)
 
       -- Stop animation if another split animation is active. Don't use
       -- `stop_split()` because it will also stop parallel animation.
-      if H.cache.split_event_id ~= event_id then return false end
+      if H.cache.split_event_id ~= event_id then
+        close_curtains()
+        return false
+      end
 
       -- Stop animation without changes if layout or pair sizes were changed
       -- not by animation (like if window was closed or resized)
-      if is_changed_outside() then return H.stop_split() end
+      if is_changed_outside() then
+        close_curtains()
+        return H.stop_split()
+      end
 
       -- Perform animation. Ensure that only pair windows are affected (as it
       -- is not always the case, like with windows of fixed size).
@@ -2268,12 +2352,16 @@ H.make_split_open_step = function(data, opts)
       sync_others()
       local ok_step = pcall(apply_step, step_sizes[step])
       if not (ok_step and H.is_resize_state_kept(state_to, pair_wins)) then
+        close_curtains()
         restore_final()
         return H.stop_split()
       end
       track_state()
 
-      if step < n_steps then return true end
+      if step < n_steps then
+        pcall(update_curtains, step)
+        return true
+      end
 
       -- Ensure final state
       finish()
@@ -2302,6 +2390,9 @@ H.make_split_close_step = function(data, opts)
   end
   if n_steps == 0 then return end
 
+  -- Fade out content with reversed open animation transparency
+  local blends = H.get_split_winblends(opts.winblend, n_steps)
+
   -- Floating windows per imitated window. Track if some were closed not by
   -- animation, as they should not be reopened.
   local floats, is_closed_outside = {}, false
@@ -2318,7 +2409,8 @@ H.make_split_close_step = function(data, opts)
       local size = get_size(r, step)
       for _, w in ipairs(r.wins) do
         floats[w.win_id] = floats[w.win_id] or {}
-        is_closed_outside = is_closed_outside or not H.draw_split_floats(floats[w.win_id], w, r, size)
+        local ok = H.draw_split_floats(floats[w.win_id], w, r, size, blends[n_steps - step])
+        is_closed_outside = is_closed_outside or not ok
       end
     end
   end
@@ -2633,7 +2725,7 @@ end
 -- Draw floating windows imitating window `w` inside squeezed region `r`.
 -- Update `floats` (with part names as keys and window ids as values) in place.
 -- Return `false` if some of them was closed not by animation.
-H.draw_split_floats = function(floats, w, r, size)
+H.draw_split_floats = function(floats, w, r, size, winblend)
   for _, float_win_id in pairs(floats) do
     if not vim.api.nvim_win_is_valid(float_win_id) then return false end
   end
@@ -2648,6 +2740,11 @@ H.draw_split_floats = function(floats, w, r, size)
   local frame = { from = map(w[from_key]), to = map(w[to_key] + 1) - 1, has_line = w[from_key] == r.from + 1 }
   local configs = (is_vert and H.get_split_vert_configs or H.get_split_horiz_configs)(w, r, frame)
 
+  -- Fade window content (winbar and text) with floating window on top
+  local area = configs.content_area
+  configs.content_area = nil
+  if area ~= nil and winblend < 100 then configs.curtain = { win_config = area, winblend = winblend } end
+
   for name, float_win_id in pairs(floats) do
     if configs[name] == nil then
       H.close_split_floats(float_win_id)
@@ -2655,15 +2752,18 @@ H.draw_split_floats = function(floats, w, r, size)
     end
   end
   -- Use fixed order for consistent window layering
-  for _, name in ipairs({ 'text', 'line', 'winbar', 'statusline' }) do
+  for _, name in ipairs({ 'text', 'line', 'winbar', 'statusline', 'curtain' }) do
     local config = configs[name]
     if config ~= nil and floats[name] ~= nil then
       vim.api.nvim_win_set_config(floats[name], config.win_config)
+    elseif config ~= nil and name == 'curtain' then
+      floats[name] = H.open_split_curtain(config.win_config, H.get_normal_hl(w.winhighlight, w.is_current))
     elseif config ~= nil and config.line ~= nil then
       floats[name] = H.open_split_line_float(config)
     elseif config ~= nil then
       floats[name] = H.open_split_float(w, config.win_config)
     end
+    if name == 'curtain' and floats[name] ~= nil then H.set_winblend_silently(floats[name], config.winblend) end
   end
   return true
 end
@@ -2698,7 +2798,10 @@ H.get_split_vert_configs = function(w, r, frame)
   if bottom ~= '' and w.statusline ~= nil then
     config.footer, config.footer_pos = H.fit_chunks(w.statusline, width, w.horiz_border), 'left'
   end
-  return { text = { win_config = config } }
+  -- Content area is to the right of left border and includes winbar
+  local content_area =
+    { relative = 'editor', row = w.top, col = frame.from, width = width, height = w.height + w.winbar }
+  return { text = { win_config = config }, content_area = content_area }
 end
 
 -- Horizontal region: imitate text area with a floating window (with right
@@ -2717,7 +2820,9 @@ H.get_split_horiz_configs = function(w, r, frame)
     border = has_vsep and { '', '', '', w.vert_border, '', '', '', '' } or 'none',
   })
 
-  local res = { text = { win_config = text_config } }
+  local content_area =
+    { relative = 'editor', row = frame.from, col = w.left, width = w.width, height = height + w.winbar }
+  local res = { text = { win_config = text_config }, content_area = content_area }
   local line_width = w.width + (has_vsep and 1 or 0)
   local add_line = function(name, row, chunks, fill, tail)
     local config = vim.tbl_extend('force', base_config, { row = row, width = line_width, height = 1, border = 'none' })
@@ -2796,9 +2901,7 @@ H.open_split_float = function(w, config)
   -- options silently and before view (as 'scrollbind' can affect others).
   -- Floating window uses 'NormalNC' only if it is set in 'winhighlight'
   local winhighlight = show_buf and w.winhighlight or ''
-  local normal_hl = (',' .. winhighlight):match(',Normal:([^,]+)') or 'Normal'
-  local use_normalnc = not w.is_current and (',' .. winhighlight):find(',NormalNC:') == nil
-  if use_normalnc and next(vim.api.nvim_get_hl(0, { name = 'NormalNC' })) ~= nil then normal_hl = 'NormalNC' end
+  local normal_hl = H.get_normal_hl(winhighlight, w.is_current)
   local extra_hl = 'NormalFloat:' .. normal_hl .. (w.is_current and (',NormalNC:' .. normal_hl) or '')
   winhighlight = winhighlight == '' and extra_hl or (winhighlight .. ',' .. extra_hl)
   local opts = vim.tbl_extend('force', show_buf and w.opts or {}, {
@@ -2830,6 +2933,43 @@ H.open_split_float = function(w, config)
   end)
 
   return float_win_id
+end
+
+-- Open empty floating window used to fade content below it
+H.open_split_curtain = function(config, normal_hl)
+  H.ensure_empty_buf()
+  local extra = { anchor = 'NW', focusable = false, style = 'minimal', zindex = 2, border = 'none', noautocmd = true }
+  local ok, float_win_id = pcall(vim.api.nvim_open_win, H.empty_buf_id, false, vim.tbl_extend('force', config, extra))
+  if not ok then return nil end
+  H.cache.split_floats[float_win_id] = true
+  local setlocal = 'silent! noautocmd setlocal winhighlight=NormalFloat:' .. vim.fn.escape(normal_hl, ' \\|"')
+  if H.has_eventignorewin then setlocal = setlocal .. ' eventignorewin=all' end
+  vim.api.nvim_win_call(float_win_id, function() vim.cmd(setlocal) end)
+  return float_win_id
+end
+
+H.set_winblend_silently = function(win_id, winblend)
+  vim.api.nvim_win_call(win_id, function() vim.cmd('noautocmd setlocal winblend=' .. winblend) end)
+end
+
+-- Compute 'winblend' values of fading floating windows for all steps
+H.get_split_winblends = function(winblend, n_steps)
+  local res = {}
+  for step = 0, n_steps do
+    local value = tonumber(winblend(step, n_steps)) or 100
+    res[step] = H.round(math.min(math.max(value, 0), 100))
+  end
+  return res
+end
+
+-- Get highlight group which imitates normal text of window. Not current
+-- window uses 'NormalNC' (if it is set).
+H.get_normal_hl = function(winhighlight, is_current)
+  local normal_hl = (',' .. winhighlight):match(',Normal:([^,]+)') or 'Normal'
+  if is_current then return normal_hl end
+  local normalnc_hl = (',' .. winhighlight):match(',NormalNC:([^,]+)')
+  if normalnc_hl ~= nil then return normalnc_hl end
+  return next(vim.api.nvim_get_hl(0, { name = 'NormalNC' })) ~= nil and 'NormalNC' or normal_hl
 end
 
 H.close_split_floats = function(win_id)
