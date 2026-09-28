@@ -555,6 +555,8 @@ Notes:
   might look slightly different from actual ones.
   On Neovim<0.11 resizing floating windows triggers |WinResized| and
   |WinScrolled| events (as there is no |'eventignorewin'|).
+  Not imitated: filler lines in |diff-mode| and not concealed cursor line
+  of window which was current (see |'concealcursor'|).
 
 Configuration example: >lua
 

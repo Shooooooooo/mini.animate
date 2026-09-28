@@ -487,6 +487,8 @@ end
 ---   might look slightly different from actual ones.
 ---   On Neovim<0.11 resizing floating windows triggers |WinResized| and
 ---   |WinScrolled| events (as there is no |'eventignorewin'|).
+---   Not imitated: filler lines in |diff-mode| and not concealed cursor line
+---   of window which was current (see |'concealcursor'|).
 ---
 --- Configuration example: >lua
 ---
@@ -1346,6 +1348,7 @@ H.cache = {
   resize_event_id = 0,
   resize_is_active = false,
   resize_target = nil,
+  resize_tabpage = nil,
   resize_state = { layout = {}, sizes = {}, views = {} },
 
   -- Window open animation data
@@ -1364,8 +1367,10 @@ H.cache = {
   -- Data about split window open/close waiting for layout to settle
   split_pending_open = nil,
   split_pending_close = nil,
-  -- Floating windows and (reusable) buffers used in close animation
+  -- Floating windows and (reusable) buffers used in close animation. Also
+  -- options which should be restored before closing floating windows.
   split_floats = {},
+  split_float_restore = {},
   split_line_bufs = {},
   -- Callable to immediately finish current animation
   split_finish = nil,
@@ -1577,7 +1582,7 @@ H.auto_resize = function()
   if not animate_step then return end
 
   H.start_resize(prev_state)
-  H.cache.resize_target = new_state
+  H.cache.resize_target, H.cache.resize_tabpage = new_state, vim.api.nvim_get_current_tabpage()
   MiniAnimate.animate(animate_step.step_action, animate_step.step_timing)
 end
 
@@ -1723,7 +1728,8 @@ H.auto_split = function()
   H.cache.split_event_id = H.cache.split_event_id + 1
   H.cache.split_finish = nil
   H.close_split_floats()
-  if H.cache.resize_is_active then
+  -- Resize animation in other tabpage doesn't interfere and can continue
+  if H.cache.resize_is_active and H.cache.resize_tabpage == vim.api.nvim_get_current_tabpage() then
     H.cache.resize_event_id = H.cache.resize_event_id + 1
     H.finish_resize()
   end
@@ -2018,23 +2024,27 @@ end
 -- from split animation). Apply its final sizes only to windows and dimensions
 -- not changed since its last step (like after split), as others are outdated.
 H.finish_resize = function()
-  local target, last, sizes = H.cache.resize_target, H.cache.resize_state, {}
+  local target, last, todo = H.cache.resize_target, H.cache.resize_state, {}
   if target ~= nil and vim.deep_equal(target.layout, last.layout) then
     for win_id, dims in pairs(target.sizes) do
       local last_dims = last.sizes[win_id]
       if vim.api.nvim_win_is_valid(win_id) and last_dims ~= nil then
-        local height, width = vim.api.nvim_win_get_height(win_id), vim.api.nvim_win_get_width(win_id)
-        sizes[win_id] = {
-          height = height == last_dims.height and dims.height or height,
-          width = width == last_dims.width and dims.width or width,
-        }
+        if vim.api.nvim_win_get_height(win_id) == last_dims.height then
+          table.insert(todo, { vim.api.nvim_win_set_height, win_id, dims.height })
+        end
+        if vim.api.nvim_win_get_width(win_id) == last_dims.width then
+          table.insert(todo, { vim.api.nvim_win_set_width, win_id, dims.width })
+        end
       end
     end
   end
   -- Apply twice as setting size of one window can affect others
   for _ = 1, 2 do
-    pcall(H.apply_resize_state, { sizes = sizes }, false)
+    for _, t in ipairs(todo) do
+      pcall(t[1], t[2], t[3])
+    end
   end
+  if #todo > 0 then H.cache.resize_state = H.get_resize_state() end
   H.stop_resize()
 end
 
@@ -2477,11 +2487,7 @@ H.get_split_snapshot = function()
   for _, win_id in ipairs(H.get_layout_windows(layout)) do
     local info = vim.fn.getwininfo(win_id)[1]
     local top, left, text_top = info.winrow - 1, info.wincol - 1, info.winrow - 1 + info.winbar
-    local opts = {}
-    for _, name in ipairs(H.split_float_options) do
-      local ok, value = pcall(vim.api.nvim_get_option_value, name, { scope = 'local', win = win_id })
-      if ok then opts[name] = value end
-    end
+    local opts = H.get_win_local_options(win_id)
 
     wins[win_id] = {
       win_id = win_id,
@@ -2489,8 +2495,11 @@ H.get_split_snapshot = function()
       view = vim.api.nvim_win_call(win_id, vim.fn.winsaveview),
       opts = opts,
       folds = opts.foldenable and vim.api.nvim_win_call(win_id, H.get_closed_folds) or {},
+      fold_range = { info.topline, info.botline },
       matches = vim.fn.getmatches(win_id),
-      winhighlight = vim.wo[win_id].winhighlight,
+      winhighlight = opts.winhighlight or '',
+      hl_map = H.parse_winhighlight(opts.winhighlight or ''),
+      fillchars = vim.api.nvim_win_call(win_id, H.get_fillchars),
       is_current = win_id == cur_win_id,
       -- Text area data
       text_top = text_top,
@@ -2506,10 +2515,14 @@ H.get_split_snapshot = function()
   end
 
   -- Compute status lines and winbars before layout is changed, as their
-  -- content can depend on window size and whether it is current
+  -- content can depend on window size and whether it is current. Don't show
+  -- 'showcmd' content as it has keys of command closing window.
+  local showcmd = vim.o.showcmd
+  if showcmd then vim.cmd('noautocmd set noshowcmd') end
   for _, w in pairs(wins) do
-    H.eval_split_lines(w)
+    pcall(H.eval_split_lines, w)
   end
+  if showcmd then vim.cmd('noautocmd set showcmd') end
 
   return { layout = layout, wins = wins, laststatus = vim.o.laststatus, fillchars = vim.opt.fillchars:get() }
 end
@@ -2529,23 +2542,81 @@ H.get_closed_folds = function()
   return res
 end
 
--- Window options to use in floating windows imitating windows
---stylua: ignore
-H.split_float_options = {
-  'breakindent', 'breakindentopt', 'colorcolumn', 'concealcursor', 'conceallevel', 'cursorcolumn',
-  'cursorline', 'cursorlineopt', 'fillchars', 'foldcolumn', 'foldenable', 'foldexpr', 'foldignore',
-  'foldlevel', 'foldmarker', 'foldmethod', 'foldminlines', 'foldnestmax', 'foldtext', 'linebreak', 'list',
-  'listchars', 'number', 'numberwidth', 'relativenumber', 'rightleft', 'scrolloff', 'showbreak',
-  'sidescrolloff', 'signcolumn', 'smoothscroll', 'spell', 'statuscolumn', 'virtualedit', 'wrap',
-}
+-- Get local values of all window options
+H.get_win_local_options = function(win_id)
+  if H.win_option_names == nil then
+    H.win_option_names = {}
+    for name, info in pairs(vim.api.nvim_get_all_options_info()) do
+      if info.scope == 'win' then table.insert(H.win_option_names, name) end
+    end
+  end
+  local res = {}
+  for _, name in ipairs(H.win_option_names) do
+    local ok, value = pcall(vim.api.nvim_get_option_value, name, { scope = 'local', win = win_id })
+    if ok then res[name] = value end
+  end
+  return res
+end
+
+-- Window options which should not be copied to floating windows as they
+-- affect other windows
+H.split_float_ignore_options = { diff = true, previewwindow = true }
+
+-- Get 'fillchars' of current window. Empty local value means global one.
+H.get_fillchars = function()
+  local res = vim.opt_local.fillchars:get()
+  return next(res) ~= nil and res or vim.opt_global.fillchars:get()
+end
+
+-- Parse 'winhighlight' into map from highlight group to its replacement
+H.parse_winhighlight = function(winhighlight)
+  local res = {}
+  for _, pair in ipairs(vim.split(winhighlight, ',', { trimempty = true })) do
+    local from, to = pair:match('^(.-):(.*)$')
+    if from ~= nil then res[from] = to end
+  end
+  return res
+end
+
+-- Replace highlight group(s) as in 'winhighlight'
+H.remap_hl = function(hl, hl_map)
+  if type(hl) == 'table' then
+    return vim.tbl_map(function(x) return hl_map[x] or x end, hl)
+  end
+  return hl_map[hl] or hl
+end
 
 -- Compute status line and winbar content (as text chunks and base highlight)
 H.eval_split_lines = function(w)
+  local remap = function(chunks, hl)
+    for _, chunk in ipairs(chunks or {}) do
+      chunk[2] = H.remap_hl(chunk[2], w.hl_map)
+    end
+    return chunks, hl and H.remap_hl(hl, w.hl_map)
+  end
+
   if vim.o.laststatus ~= 3 and w.bottom > w.text_top + w.height - 1 then
-    w.statusline, w.statusline_hl = H.eval_statusline(w.win_id, false, w.width)
+    local is_term = vim.bo[w.buf_id].buftype == 'terminal' and vim.fn.has('nvim-0.11') == 1
+    local base_hl = (is_term and 'StatusLineTerm' or 'StatusLine') .. (w.is_current and '' or 'NC')
+    local chunks, hl
+    if vim.wo[w.win_id].statusline == '' then
+      local fill = w.fillchars.stlnc or ' '
+      if w.is_current then fill = w.fillchars.stl or ' ' end
+      chunks, hl = H.get_builtin_statusline(w.win_id, w.width, fill, base_hl), base_hl
+    else
+      chunks, hl = H.eval_statusline(w.win_id, false, w.width)
+      -- Terminal window has special base groups, but they are not reported
+      local term_groups = { StatusLine = 'StatusLineTerm', StatusLineNC = 'StatusLineTermNC' }
+      for _, chunk in ipairs(is_term and chunks or {}) do
+        if type(chunk[2]) == 'table' then chunk[2][1] = term_groups[chunk[2][1]] or chunk[2][1] end
+      end
+      hl = is_term and (term_groups[hl] or hl) or hl
+    end
+    w.statusline, w.statusline_hl = remap(chunks, hl or base_hl)
   end
   if w.winbar == 1 then
-    w.winbar_line, w.winbar_hl = H.eval_statusline(w.win_id, true, w.width)
+    local chunks, hl = H.eval_statusline(w.win_id, true, w.width)
+    w.winbar_line, w.winbar_hl = remap(chunks, hl or (w.is_current and 'WinBar' or 'WinBarNC'))
   end
 end
 
@@ -2601,8 +2672,17 @@ H.get_split_close_regions = function(snapshot)
     for _, win_id in ipairs(H.get_layout_windows(children[line_ind - 1])) do
       is_line_before_current = is_line_before_current or wins[win_id].is_current
     end
+    -- Use highlighting of window which owns split line (window separator or
+    -- status line of window before it)
+    local owner
+    for _, win_id in ipairs(H.get_layout_windows(children[line_ind - 1])) do
+      local w = wins[win_id]
+      local is_owner = (r.dim == 'width' and w.right == r.from) or (r.dim == 'height' and w.bottom == r.from)
+      if owner == nil and is_owner then owner = w end
+    end
     local line_type = r.dim == 'width' and 'vert' or 'horiz'
-    r.line_border = H.get_split_border_char(snapshot, line_type, { is_current = is_line_before_current })
+    owner = vim.tbl_extend('force', owner or {}, { is_current = is_line_before_current })
+    r.line_border = H.get_split_border_char(snapshot, line_type, owner)
 
     table.insert(regions, r)
   end
@@ -2611,12 +2691,26 @@ H.get_split_close_regions = function(snapshot)
   -- Precompute how floating window borders look: separators, status lines
   for _, r in ipairs(regions) do
     for _, w in ipairs(r.wins) do
-      w.vert_border = H.get_split_border_char(snapshot, 'vert')
+      -- Window separator to the left belongs to window on the left
+      local left_owner
+      for _, left in pairs(wins) do
+        if left.right == w.left - 1 and left.top <= w.top and w.top <= left.bottom then left_owner = left end
+      end
+      w.left_border = H.get_split_border_char(snapshot, 'vert', left_owner)
+      w.vert_border = H.get_split_border_char(snapshot, 'vert', w)
       w.horiz_border = H.get_split_border_char(snapshot, 'horiz', w)
-      w.winbar_border = { snapshot.fillchars.wbr or ' ', w.winbar_hl or (w.is_current and 'WinBar' or 'WinBarNC') }
+      w.winbar_border = { w.fillchars.wbr or ' ', w.winbar_hl or (w.is_current and 'WinBar' or 'WinBarNC') }
       -- Cells where separators and status lines meet
       w.corner_border = H.get_split_corner(snapshot, w.bottom, w.left - 1) or w.horiz_border
       w.stl_corner = H.get_split_corner(snapshot, w.bottom, w.right)
+
+      -- Global status line: separator below window can have intersections
+      if snapshot.laststatus == 3 and w.bottom > w.text_top + w.height - 1 then
+        w.statusline = {}
+        for col = w.left, w.left + w.width - 1 do
+          table.insert(w.statusline, H.get_split_corner(snapshot, w.bottom, col) or w.horiz_border)
+        end
+      end
 
       -- Horizontal split line shows status lines of windows above it
       if r.dim == 'height' and w.top == r.from + 1 then
@@ -2630,12 +2724,13 @@ end
 
 -- Get how separator or status line of window `w` (in pre-close layout) looks
 H.get_split_border_char = function(snapshot, type, w)
-  local fillchars = snapshot.fillchars
-  if type == 'vert' then return { fillchars.vert or '│', 'WinSeparator' } end
-  if snapshot.laststatus == 3 then return { fillchars.horiz or '─', 'WinSeparator' } end
-  local is_current = w ~= nil and w.is_current
-  local char = (is_current and fillchars.stl or fillchars.stlnc) or ' '
-  return { char, (w or {}).statusline_hl or (is_current and 'StatusLine' or 'StatusLineNC') }
+  w = w or {}
+  local fillchars, hl_map = w.fillchars or snapshot.fillchars, w.hl_map or {}
+  if type == 'vert' then return { fillchars.vert or '│', H.remap_hl('WinSeparator', hl_map) } end
+  if snapshot.laststatus == 3 then return { fillchars.horiz or '─', H.remap_hl('WinSeparator', hl_map) } end
+  local char = fillchars.stlnc or ' '
+  if w.is_current then char = fillchars.stl or ' ' end
+  return { char, w.statusline_hl or H.remap_hl(w.is_current and 'StatusLine' or 'StatusLineNC', hl_map) }
 end
 
 -- Get how cell at `row` (with status line or horizontal separator) and `col`
@@ -2660,7 +2755,7 @@ H.get_split_corner = function(snapshot, row, col)
     if w == nil then return nil end
     local is_stl = w.bottom == row and w.bottom > w.text_top + w.height - 1
     local is_connected = is_stl and H.is_stl_connected(snapshot.layout, w.win_id)
-    return is_connected and H.get_split_border_char(snapshot, 'horiz', w) or H.get_split_border_char(snapshot, 'vert')
+    return H.get_split_border_char(snapshot, is_connected and 'horiz' or 'vert', w)
   end
 
   -- Global status line: use connector character based on adjacent separators
@@ -2785,7 +2880,7 @@ H.get_split_vert_configs = function(w, r, frame)
   local width = frame.to - frame.from + 1 - (has_vsep and 1 or 0)
   if width < 1 then return {} end
 
-  local left = frame.has_line and r.line_border or w.vert_border
+  local left = frame.has_line and r.line_border or w.left_border
   local base_config = { relative = 'editor', anchor = 'NW', col = frame.from - 1, focusable = false, zindex = 1 }
   local text_config = vim.tbl_extend('force', base_config, {
     row = w.text_top,
@@ -2904,35 +2999,81 @@ H.open_split_float = function(w, config)
   local normal_hl = H.get_normal_hl(winhighlight, w.is_current)
   local extra_hl = 'NormalFloat:' .. normal_hl .. (w.is_current and (',NormalNC:' .. normal_hl) or '')
   winhighlight = winhighlight == '' and extra_hl or (winhighlight .. ',' .. extra_hl)
-  local opts = vim.tbl_extend('force', show_buf and w.opts or {}, {
+  -- Ignore only window events for regular buffer (as ignoring all of them
+  -- also affects buffer events)
+  local eventignorewin = show_buf and 'WinScrolled,WinResized' or 'all'
+  local overrides = {
     cursorbind = false,
     scrollbind = false,
     winbar = '',
     winblend = 0,
     winhighlight = winhighlight,
-    eventignorewin = H.has_eventignorewin and 'all' or nil,
-  })
+    eventignorewin = H.has_eventignorewin and eventignorewin or nil,
+  }
+  local opts = {}
+  for name, value in pairs(show_buf and w.opts or {}) do
+    if not H.split_float_ignore_options[name] then opts[name] = value end
+  end
   vim.api.nvim_win_call(float_win_id, function()
-    for name, value in pairs(opts) do
-      local opt = type(value) ~= 'boolean' and (name .. '=' .. vim.fn.escape(tostring(value), ' \\|"'))
-        or ((value and '' or 'no') .. name)
-      vim.cmd('silent! noautocmd setlocal ' .. opt)
-    end
+    H.set_local_options(vim.tbl_extend('force', opts, overrides))
     if not show_buf then return end
-
-    -- Imitate window-local state: closed folds, matches, view
-    if #w.folds > 0 then
-      vim.cmd('silent! noautocmd setlocal foldmethod=manual')
-      pcall(H.exec_normal, 'silent! normal! zE')
-      for _, fold in ipairs(w.folds) do
-        pcall(vim.cmd, string.format('silent! %d,%dfold', fold[1], fold[2]))
-      end
-    end
+    H.imitate_folds(w)
     pcall(vim.fn.setmatches, w.matches)
     pcall(vim.fn.winrestview, w.view)
   end)
 
+  -- Restore options before closing as they are saved for the buffer and
+  -- are used in the next window showing it
+  if show_buf then
+    local restore = {}
+    for name, _ in pairs(overrides) do
+      restore[name] = w.opts[name]
+    end
+    H.cache.split_float_restore[float_win_id] = restore
+  end
+
   return float_win_id
+end
+
+-- Set local options of current window silently
+H.set_local_options = function(opts)
+  for name, value in pairs(opts) do
+    local opt = type(value) ~= 'boolean' and (name .. '=' .. vim.fn.escape(tostring(value), ' \\|"'))
+      or ((value and '' or 'no') .. name)
+    vim.cmd('silent! noautocmd setlocal ' .. opt)
+  end
+end
+
+-- Imitate closed folds of window `w` in current window
+H.imitate_folds = function(w)
+  if not w.opts.foldenable then return end
+  local errmsg = vim.v.errmsg
+
+  -- Manual folds can not be copied (and diff folds are not computed in not
+  -- diff window), so recreate closed ones
+  if w.opts.foldmethod == 'manual' or w.opts.foldmethod == 'diff' then
+    vim.cmd('silent! noautocmd setlocal foldmethod=manual')
+    pcall(H.exec_normal, 'silent! normal! zE')
+    for _, fold in ipairs(w.folds) do
+      pcall(vim.cmd, string.format('silent! %d,%dfold', fold[1], fold[2]))
+    end
+    vim.v.errmsg = errmsg
+    return
+  end
+
+  -- Other folds are computed the same way (as options are the same), so only
+  -- open/close them. Close the deepest open fold until it is as needed.
+  pcall(vim.cmd, string.format('silent! %d,%dfoldopen!', w.fold_range[1], w.fold_range[2]))
+  for _, fold in ipairs(w.folds) do
+    local state = {}
+    for _ = 1, 100 do
+      local cur_state = { vim.fn.foldclosed(fold[1]), vim.fn.foldclosedend(fold[1]) }
+      if (cur_state[1] == fold[1] and cur_state[2] == fold[2]) or vim.deep_equal(cur_state, state) then break end
+      state = cur_state
+      pcall(vim.cmd, 'silent! ' .. fold[1] .. 'foldclose')
+    end
+  end
+  vim.v.errmsg = errmsg
 end
 
 -- Open empty floating window used to fade content below it
@@ -3040,16 +3181,19 @@ H.close_split_floats = function(win_id)
   local win_ids = win_id == nil and vim.tbl_keys(H.cache.split_floats) or { win_id }
   for _, id in ipairs(win_ids) do
     H.cache.split_floats[id] = nil
-    if vim.api.nvim_win_is_valid(id) then
+    local is_valid = vim.api.nvim_win_is_valid(id)
+    if not is_valid then H.cache.split_float_restore[id] = nil end
+    if is_valid then
       -- Hide buffer (to not unload it due to 'hidden'). Do it silently if
       -- buffer stays loaded (to not trigger events for something already
       -- done), otherwise let it be done properly (like due to 'bufhidden').
       local buf_id = vim.api.nvim_win_get_buf(id)
       local bufhidden = vim.bo[buf_id].bufhidden
       local stays_loaded = #vim.fn.win_findbuf(buf_id) > 1 or bufhidden == '' or bufhidden == 'hide'
-      if not stays_loaded and H.has_eventignorewin then
-        vim.api.nvim_win_call(id, function() vim.cmd('noautocmd setlocal eventignorewin=') end)
-      end
+      local restore = H.cache.split_float_restore[id] or {}
+      if not stays_loaded and H.has_eventignorewin then restore.eventignorewin = '' end
+      vim.api.nvim_win_call(id, function() H.set_local_options(restore) end)
+      H.cache.split_float_restore[id] = nil
       pcall(vim.cmd, string.format('%scall nvim_win_hide(%d)', stays_loaded and 'noautocmd ' or '', id))
     end
   end
@@ -3487,11 +3631,10 @@ H.set_buf_name = function(buf_id, name) vim.api.nvim_buf_set_name(buf_id, 'minia
 -- Evaluate status line (or winbar) of a window as array of `{ text, hl_group }`
 H.eval_statusline = function(win_id, is_winbar, maxwidth)
   local statusline = vim.wo[win_id][is_winbar and 'winbar' or 'statusline']
-  if statusline == '' and not is_winbar then statusline = H.get_builtin_statusline(win_id, maxwidth) end
+  return H.eval_statusline_string(win_id, statusline, is_winbar, maxwidth)
+end
 
-  -- Don't show 'showcmd' content, as it has keys of command closing window
-  statusline = H.hide_showcmd(statusline)
-
+H.eval_statusline_string = function(win_id, statusline, is_winbar, maxwidth)
   -- Evaluate silently, as errors are shown as messages (not caught by
   -- `pcall`) which can abort current command
   local opts = { winid = win_id, highlights = true, use_winbar = is_winbar, maxwidth = maxwidth }
@@ -3503,14 +3646,10 @@ H.eval_statusline = function(win_id, is_winbar, maxwidth)
   vim.g.minianimate_statusline, vim.v.errmsg = nil, errmsg
   if type(data) ~= 'table' then return nil end
 
-  -- Use combined highlight groups if present (Neovim>=0.11). Terminal window
-  -- has special base groups, but they are not reported.
-  local is_term = not is_winbar and vim.bo[vim.api.nvim_win_get_buf(win_id)].buftype == 'terminal'
-  local term_groups = { StatusLine = 'StatusLineTerm', StatusLineNC = 'StatusLineTermNC' }
+  -- Use combined highlight groups if present (Neovim>=0.11)
   local res, highlights, base_hl = {}, data.highlights, nil
   for i, hl in ipairs(highlights) do
     local groups = hl.groups
-    if groups ~= nil and is_term then groups[1] = term_groups[groups[1]] or groups[1] end
     base_hl = base_hl or (groups or {})[1]
     local text = data.str:sub(hl.start + 1, highlights[i + 1] == nil and data.str:len() or highlights[i + 1].start)
     if text ~= '' then table.insert(res, { text, groups or hl.group }) end
@@ -3518,52 +3657,85 @@ H.eval_statusline = function(win_id, is_winbar, maxwidth)
   return #res > 0 and res or nil, base_hl
 end
 
--- Imitate built-in status line (used when 'statusline' is empty)
-H.get_builtin_statusline = function(win_id, width)
-  -- Ruler starts at fixed column but not before the middle. File name is
-  -- truncated from start to fit before it with at least one cell gap.
-  local ruler_col = vim.o.ruler and math.max(width - 18, math.floor((width + 1) / 2)) or width
-  local name = vim.api.nvim_eval_statusline('%f%( %h%w%m%r%)', { winid = win_id }).str
-  local chars, name_width, n_drop = vim.fn.split(name, '\\zs'), vim.fn.strdisplaywidth(name), 0
-  while n_drop < #chars and name_width >= ruler_col - 1 do
-    n_drop, name_width = n_drop + 1, name_width - vim.fn.strdisplaywidth(chars[n_drop + 1])
+-- Imitate built-in status line (used when 'statusline' is empty) as array of
+-- text chunks. Follows `win_redr_status()` and `win_redr_ruler()` from source.
+H.get_builtin_statusline = function(win_id, width, fill, hl)
+  local buf_id = vim.api.nvim_win_get_buf(win_id)
+
+  -- File name with flags
+  local name = vim.api.nvim_eval_statusline('%f', { winid = win_id, maxwidth = 10000 }).str
+  local buftype = vim.bo[buf_id].buftype
+  local is_help, is_preview, is_ro = buftype == 'help', vim.wo[win_id].previewwindow, vim.bo[buf_id].readonly
+  local can_write = not vim.tbl_contains({ 'nofile', 'nowrite', 'terminal', 'prompt' }, buftype)
+  local is_changed = vim.bo[buf_id].modified and can_write
+  if is_help or is_preview or is_changed or is_ro then name = name .. ' ' end
+  name = name .. (is_help and '[Help]' or '') .. (is_preview and '[Preview]' or '')
+  name = name .. (is_changed and '[+]' or '') .. (is_ro and '[RO]' or '')
+
+  -- Ruler starts at fixed column (possibly defined by 'rulerformat') but not
+  -- before the middle. File name is truncated to fit before it.
+  local rulerformat = vim.o.rulerformat
+  local ruler_width = tonumber(rulerformat:match('^%%%-?(%d+)%(') or '') or 17
+  local ruler_col = math.max(vim.o.ruler and (width - ruler_width - 1) or width, math.floor((width + 1) / 2))
+  local name_width = vim.fn.strdisplaywidth(name)
+  if ruler_col <= 1 then
+    name, name_width = '<', 1
+  else
+    local chars, n_drop = vim.fn.split(name, '\\zs'), 0
+    while n_drop < #chars and name_width >= ruler_col - 1 do
+      n_drop, name_width = n_drop + 1, name_width - vim.fn.strdisplaywidth(chars[n_drop + 1])
+    end
+    if n_drop > 0 then
+      name, name_width = '<' .. table.concat(chars, '', n_drop + 1), name_width + 1
+    end
   end
-  if n_drop > 0 then name = '<' .. table.concat(chars, '', n_drop + 1) end
-  local res = string.format('%%-%d.%d(%s%%)', ruler_col, ruler_col, name:gsub('%%', '%%%%'))
+  local text = name .. string.rep(fill, ruler_col - name_width)
+
+  -- Keymap is shown before ruler if there is space for it
+  local keymap = ''
+  if vim.bo[buf_id].iminsert == 1 then
+    local keymap_name = vim.b[buf_id].keymap_name
+    if type(keymap_name) ~= 'string' or keymap_name == '' then
+      keymap_name = vim.bo[buf_id].keymap ~= '' and vim.bo[buf_id].keymap or 'lang'
+    end
+    keymap = '<' .. keymap_name .. '>'
+  end
+  local keymap_width = vim.fn.strdisplaywidth(keymap)
+  if keymap ~= '' and ruler_col - name_width > keymap_width + 1 then
+    text = name .. string.rep(fill, ruler_col - name_width - keymap_width - 1) .. keymap .. fill
+  end
+
+  local res = { { text, hl } }
   if not vim.o.ruler then return res end
 
-  -- Custom ruler skips its leading group specification
-  if vim.o.rulerformat ~= '' then return res .. vim.o.rulerformat:gsub('^%%%-?%d*%(', '') end
+  -- Custom ruler is evaluated without its leading group specification
+  if rulerformat ~= '' then
+    local ruler = H.eval_statusline_string(win_id, H.strip_leading_group(rulerformat), false, width - ruler_col)
+    return vim.list_extend(res, H.fit_chunks(ruler, width - ruler_col, { fill, hl }))
+  end
 
-  -- Show relative position only if there is enough space for it
-  local get_width = function(s) return vim.api.nvim_eval_statusline(s, { winid = win_id }).width end
-  local has_space = ruler_col + get_width('%l,%c%V') + get_width('%P') < width
-  return res .. '%l,%c%V' .. (has_space and '%=%P' or '')
+  -- Default ruler shows relative position only if there is enough space
+  local eval = function(s) return vim.api.nvim_eval_statusline(s, { winid = win_id, maxwidth = 10000 }).str end
+  local ruler, rel_pos = eval('%l,%c%V'), eval('%P')
+  local n = vim.fn.strdisplaywidth(ruler) + vim.fn.strdisplaywidth(rel_pos)
+  if ruler_col + n < width then ruler = ruler .. string.rep(fill, width - ruler_col - n) .. rel_pos end
+  return vim.list_extend(res, H.fit_chunks({ { ruler, hl } }, width - ruler_col, { fill, hl }))
 end
 
--- Replace top level `%S` items of status line with empty ones
-H.hide_showcmd = function(statusline)
-  if statusline:find('S', 1, true) == nil or vim.startswith(statusline, '%!') then return statusline end
-  local res, i, n = {}, 1, statusline:len()
+-- Remove leading group specification (like `%-10(`) together with its end
+H.strip_leading_group = function(statusline)
+  local from, to = statusline:find('^%%%-?%d*%(')
+  if from == nil then return statusline end
+  local depth, i, n = 0, to + 1, statusline:len()
   while i <= n do
-    local from, to, spec, item = statusline:find('%%([-0-9.]*)(.)', i)
-    if from == nil then break end
-    table.insert(res, statusline:sub(i, from - 1))
-    if item == 'S' then
-      table.insert(res, '%' .. spec .. '{""}')
-    elseif item == '{' then
-      -- Skip expression as is
-      local is_eval = statusline:sub(to + 1, to + 1) == '%'
-      local _, expr_to = statusline:find(is_eval and '%}' or '}', to + 1, true)
-      to = expr_to or n
-      table.insert(res, statusline:sub(from, to))
-    else
-      table.insert(res, statusline:sub(from, to))
-    end
-    i = to + 1
+    local item_from, item_to, item = statusline:find('%%[-0-9.]*(.)', i)
+    if item_from == nil then break end
+    if item == '(' then depth = depth + 1 end
+    if item == ')' and depth == 0 then return statusline:sub(to + 1, item_from - 1) .. statusline:sub(item_to + 1) end
+    if item == ')' then depth = depth - 1 end
+    i = item_to + 1
   end
-  table.insert(res, statusline:sub(i))
-  return table.concat(res)
+  return statusline:sub(to + 1)
 end
 
 -- Make text chunks span exactly `width` cells: truncate or pad with fill
