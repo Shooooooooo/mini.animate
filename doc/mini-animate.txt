@@ -487,8 +487,9 @@ Its visualization is a moving split line (window separator or status line):
   the actual final layout and are gradually squeezed out.
 
 In addition to that, content (text and winbar) of windows after the split
-line fades in on open and fades out on close. It is done with empty
-floating windows on top of this content which change their transparency.
+line fades in on open and fades out on close. On open it is done with empty
+floating windows on top of this content which become more transparent.
+On close floating windows imitating content use gradually faded colors.
 
 Exact split line positions and their number is controlled by `subsplit`
 option. It is a callable which takes `size_from` and `size_to` arguments
@@ -537,10 +538,13 @@ Notes:
 - Open animation moves only the split line between new window and the one
   it was split from. If other windows are resized as a result of a split
   (like due to |'equalalways'|), they get their final sizes immediately.
-- Fading uses floating windows with `zindex` 2 (see |nvim_open_win()|).
+- Fading on open uses floating windows with `zindex` 2 (see |nvim_open_win()|).
   They show nothing and use highlighting of the window's normal text
-  (|hl-Normal| or |hl-NormalNC|, respecting |'winhighlight'|). Fading works
-  best with |'termguicolors'| enabled.
+  (|hl-Normal| or |hl-NormalNC|, respecting |'winhighlight'|). It works best
+  with |'termguicolors'| enabled.
+- Fading on close uses highlight namespaces (see |nvim_win_set_hl_ns()|) in
+  which colors of all highlight groups (except |hl-WinSeparator|) are
+  blended with the window's background. It works only with |'termguicolors'|.
 - Close animation uses floating windows with `zindex` 1 (see |nvim_open_win()|)
   to be below other floating windows. They show text only of regular
   buffers (with empty |'buftype'|) which are still loaded, otherwise an

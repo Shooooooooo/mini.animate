@@ -419,8 +419,9 @@ end
 ---   the actual final layout and are gradually squeezed out.
 ---
 --- In addition to that, content (text and winbar) of windows after the split
---- line fades in on open and fades out on close. It is done with empty
---- floating windows on top of this content which change their transparency.
+--- line fades in on open and fades out on close. On open it is done with empty
+--- floating windows on top of this content which become more transparent.
+--- On close floating windows imitating content use gradually faded colors.
 ---
 --- Exact split line positions and their number is controlled by `subsplit`
 --- option. It is a callable which takes `size_from` and `size_to` arguments
@@ -469,10 +470,13 @@ end
 --- - Open animation moves only the split line between new window and the one
 ---   it was split from. If other windows are resized as a result of a split
 ---   (like due to |'equalalways'|), they get their final sizes immediately.
---- - Fading uses floating windows with `zindex` 2 (see |nvim_open_win()|).
+--- - Fading on open uses floating windows with `zindex` 2 (see |nvim_open_win()|).
 ---   They show nothing and use highlighting of the window's normal text
----   (|hl-Normal| or |hl-NormalNC|, respecting |'winhighlight'|). Fading works
----   best with |'termguicolors'| enabled.
+---   (|hl-Normal| or |hl-NormalNC|, respecting |'winhighlight'|). It works best
+---   with |'termguicolors'| enabled.
+--- - Fading on close uses highlight namespaces (see |nvim_win_set_hl_ns()|) in
+---   which colors of all highlight groups (except |hl-WinSeparator|) are
+---   blended with the window's background. It works only with |'termguicolors'|.
 --- - Close animation uses floating windows with `zindex` 1 (see |nvim_open_win()|)
 ---   to be below other floating windows. They show text only of regular
 ---   buffers (with empty |'buftype'|) which are still loaded, otherwise an
@@ -1368,6 +1372,10 @@ H.cache = {
 
   -- Whether module's own Normal mode command is executing
   is_executing_normal = false,
+
+  -- Data for fading with highlight namespaces: highlight group definitions,
+  -- created namespaces, and identifier of definitions
+  fade = { id = 0, defs = {}, ns = {} },
 }
 
 -- Namespaces for module operations
@@ -2390,8 +2398,10 @@ H.make_split_close_step = function(data, opts)
   end
   if n_steps == 0 then return end
 
-  -- Fade out content with reversed open animation transparency
+  -- Fade out content with reversed open animation transparency. Make sure
+  -- faded colors are computed for actual highlight groups.
   local blends = H.get_split_winblends(opts.winblend, n_steps)
+  if math.min(unpack(blends, 0, n_steps)) < 100 then H.update_fade_cache() end
 
   -- Floating windows per imitated window. Track if some were closed not by
   -- animation, as they should not be reopened.
@@ -2722,10 +2732,11 @@ H.get_split_line_statusline = function(snapshot, w, row)
   return H.drop_cells(res, w.left - aboves[1].left)
 end
 
--- Draw floating windows imitating window `w` inside squeezed region `r`.
--- Update `floats` (with part names as keys and window ids as values) in place.
+-- Draw floating windows imitating window `w` inside squeezed region `r` with
+-- its content (text and winbar) visible by `visibility` percent. Update
+-- `floats` (with part names as keys and window ids as values) in place.
 -- Return `false` if some of them was closed not by animation.
-H.draw_split_floats = function(floats, w, r, size, winblend)
+H.draw_split_floats = function(floats, w, r, size, visibility)
   for _, float_win_id in pairs(floats) do
     if not vim.api.nvim_win_is_valid(float_win_id) then return false end
   end
@@ -2740,11 +2751,6 @@ H.draw_split_floats = function(floats, w, r, size, winblend)
   local frame = { from = map(w[from_key]), to = map(w[to_key] + 1) - 1, has_line = w[from_key] == r.from + 1 }
   local configs = (is_vert and H.get_split_vert_configs or H.get_split_horiz_configs)(w, r, frame)
 
-  -- Fade window content (winbar and text) with floating window on top
-  local area = configs.content_area
-  configs.content_area = nil
-  if area ~= nil and winblend < 100 then configs.curtain = { win_config = area, winblend = winblend } end
-
   for name, float_win_id in pairs(floats) do
     if configs[name] == nil then
       H.close_split_floats(float_win_id)
@@ -2752,56 +2758,50 @@ H.draw_split_floats = function(floats, w, r, size, winblend)
     end
   end
   -- Use fixed order for consistent window layering
-  for _, name in ipairs({ 'text', 'line', 'winbar', 'statusline', 'curtain' }) do
+  for _, name in ipairs({ 'text', 'line', 'winbar', 'statusline' }) do
     local config = configs[name]
     if config ~= nil and floats[name] ~= nil then
       vim.api.nvim_win_set_config(floats[name], config.win_config)
-    elseif config ~= nil and name == 'curtain' then
-      floats[name] = H.open_split_curtain(config.win_config, H.get_normal_hl(w.winhighlight, w.is_current))
     elseif config ~= nil and config.line ~= nil then
       floats[name] = H.open_split_line_float(config)
     elseif config ~= nil then
       floats[name] = H.open_split_float(w, config.win_config)
     end
-    if name == 'curtain' and floats[name] ~= nil then H.set_winblend_silently(floats[name], config.winblend) end
+  end
+
+  -- Fade content by using faded colors
+  local fade_ns = H.get_fade_ns(H.get_normal_hl(w.winhighlight, w.is_current), visibility)
+  for _, name in ipairs({ 'text', 'winbar' }) do
+    if floats[name] ~= nil then vim.api.nvim_win_set_hl_ns(floats[name], fade_ns) end
   end
   return true
 end
 
--- Vertical region: imitate window with a single floating window. Use borders
--- to show separators (left always exists), status line, and winbar. Their
--- text is shown correctly as there is left border.
+-- Vertical region: imitate text area with a floating window (with left
+-- separator or split line as border) and winbar and status line as separate
+-- ones (with left separator or intersection as their first cell)
 H.get_split_vert_configs = function(w, r, frame)
   local has_vsep, has_stl = w.right > w.left + w.width - 1, w.bottom > w.text_top + w.height - 1
   local width = frame.to - frame.from + 1 - (has_vsep and 1 or 0)
   if width < 1 then return {} end
 
-  local top = w.winbar == 1 and w.winbar_border or ''
-  local bottom = has_stl and w.horiz_border or ''
   local left = frame.has_line and r.line_border or w.vert_border
-  local bottom_left = bottom ~= '' and w.corner_border or ''
-  --stylua: ignore
-  local config = {
-    relative  = 'editor',
-    anchor    = 'NW',
-    row       = w.top,
-    col       = frame.from - 1,
-    width     = width,
-    height    = w.height,
-    focusable = false,
-    zindex    = 1,
-    border    = { top ~= '' and left or '', top, '', '', '', bottom, bottom_left, left },
-  }
-  if top ~= '' and w.winbar_line ~= nil then
-    config.title, config.title_pos = H.fit_chunks(w.winbar_line, width, w.winbar_border), 'left'
+  local base_config = { relative = 'editor', anchor = 'NW', col = frame.from - 1, focusable = false, zindex = 1 }
+  local text_config = vim.tbl_extend('force', base_config, {
+    row = w.text_top,
+    width = width,
+    height = w.height,
+    border = { '', '', '', '', '', '', '', left },
+  })
+
+  local res = { text = { win_config = text_config } }
+  local add_line = function(name, row, chunks, fill, head)
+    local config = vim.tbl_extend('force', base_config, { row = row, width = width + 1, height = 1, border = 'none' })
+    res[name] = { win_config = config, line = { chunks = chunks, fill = fill, head = head, width = width + 1 } }
   end
-  if bottom ~= '' and w.statusline ~= nil then
-    config.footer, config.footer_pos = H.fit_chunks(w.statusline, width, w.horiz_border), 'left'
-  end
-  -- Content area is to the right of left border and includes winbar
-  local content_area =
-    { relative = 'editor', row = w.top, col = frame.from, width = width, height = w.height + w.winbar }
-  return { text = { win_config = config }, content_area = content_area }
+  if w.winbar == 1 then add_line('winbar', w.top, w.winbar_line, w.winbar_border, left) end
+  if has_stl then add_line('statusline', w.bottom, w.statusline, w.horiz_border, w.corner_border) end
+  return res
 end
 
 -- Horizontal region: imitate text area with a floating window (with right
@@ -2820,9 +2820,7 @@ H.get_split_horiz_configs = function(w, r, frame)
     border = has_vsep and { '', '', '', w.vert_border, '', '', '', '' } or 'none',
   })
 
-  local content_area =
-    { relative = 'editor', row = frame.from, col = w.left, width = w.width, height = height + w.winbar }
-  local res = { text = { win_config = text_config }, content_area = content_area }
+  local res = { text = { win_config = text_config } }
   local line_width = w.width + (has_vsep and 1 or 0)
   local add_line = function(name, row, chunks, fill, tail)
     local config = vim.tbl_extend('force', base_config, { row = row, width = line_width, height = 1, border = 'none' })
@@ -2838,7 +2836,9 @@ end
 H.open_split_line_float = function(config)
   -- Compute line content: text chunks padded with fill character up to width
   local data = config.line
-  local chunks = H.fit_chunks(data.chunks, data.width - (data.tail and 1 or 0), data.fill)
+  local text_width = data.width - (data.head and 1 or 0) - (data.tail and 1 or 0)
+  local chunks = H.fit_chunks(data.chunks, text_width, data.fill)
+  if data.head then table.insert(chunks, 1, data.head) end
   if data.tail then table.insert(chunks, data.tail) end
 
   local buf_id = H.get_split_line_buf()
@@ -2958,6 +2958,70 @@ H.get_split_winblends = function(winblend, n_steps)
   for step = 0, n_steps do
     local value = tonumber(winblend(step, n_steps)) or 100
     res[step] = H.round(math.min(math.max(value, 0), 100))
+  end
+  return res
+end
+
+-- Get highlight namespace in which all highlight groups (except separators)
+-- look faded towards background of `normal_hl` to have `visibility` percent
+-- of visibility. Namespaces are cached per 5% of visibility.
+H.get_fade_ns = function(normal_hl, visibility)
+  visibility = 5 * H.round(visibility / 5)
+  if not vim.o.termguicolors or visibility >= 100 then return 0 end
+
+  local cache = H.cache.fade
+  local name = string.format('MiniAnimateFade_%d_%s_%d', cache.id, normal_hl, visibility)
+  if cache.ns[name] ~= nil then return cache.ns[name] end
+
+  local defs, dark = cache.defs, vim.o.background == 'dark'
+  local normal = vim.tbl_extend('force', defs.Normal or {}, defs[normal_hl] or {})
+  local bg, fg = normal.bg or (dark and 0x000000 or 0xffffff), normal.fg or (dark and 0xffffff or 0x000000)
+  local coef = 1 - visibility / 100
+  local ns = vim.api.nvim_create_namespace(name)
+  for group, def in pairs(defs) do
+    if not H.fade_ignore_groups[group] then
+      local new = vim.deepcopy(def)
+      new.link, new.default = nil, nil
+      new.fg = def.fg and H.blend_rgb(def.fg, bg, coef)
+      new.bg = def.bg and H.blend_rgb(def.bg, bg, coef)
+      new.sp = def.sp and H.blend_rgb(def.sp, bg, coef)
+      pcall(vim.api.nvim_set_hl, ns, group, new)
+    end
+  end
+  -- Normal text should always be faded
+  local new_normal = vim.tbl_extend('force', defs[normal_hl] or {}, { fg = H.blend_rgb(fg, bg, coef), bg = bg })
+  new_normal.link, new_normal.default = nil, nil
+  pcall(vim.api.nvim_set_hl, ns, normal_hl, new_normal)
+
+  cache.ns[name] = ns
+  return ns
+end
+
+H.fade_ignore_groups = { WinSeparator = true, VertSplit = true }
+
+-- Update definitions of highlight groups used to compute faded colors
+H.update_fade_cache = function()
+  if not vim.o.termguicolors then return end
+  local defs = {}
+  for _, name in ipairs(vim.fn.getcompletion('', 'highlight')) do
+    -- Use parent group for not defined hierarchical ones (like `@a.b`)
+    local cur, def = name, {}
+    while cur ~= nil and next(def) == nil do
+      def = vim.api.nvim_get_hl(0, { id = vim.fn.synIDtrans(vim.fn.hlID(cur)) })
+      cur = cur:match('^(.+)%.[^.]*$')
+    end
+    defs[name] = def
+  end
+  if vim.deep_equal(defs, H.cache.fade.defs) then return end
+  H.cache.fade = { id = H.cache.fade.id + 1, defs = defs, ns = {} }
+end
+
+-- Blend two RGB colors: 0 - first one, 1 - second one
+H.blend_rgb = function(a, b, coef)
+  local res = 0
+  for _, base in ipairs({ 65536, 256, 1 }) do
+    local x, y = math.floor(a / base) % 256, math.floor(b / base) % 256
+    res = res + base * H.round(x + (y - x) * coef)
   end
   return res
 end
