@@ -2606,12 +2606,46 @@ H.parse_winhighlight = function(winhighlight)
   return res
 end
 
--- Replace highlight group(s) as in 'winhighlight'
+-- Remap highlight group as in window with 'winhighlight': it applies to any
+-- group in the chain of links and its target is resolved globally
 H.remap_hl = function(hl, hl_map)
   if type(hl) == 'table' then
-    return vim.tbl_map(function(x) return hl_map[x] or x end, hl)
+    return vim.tbl_map(function(x) return H.remap_hl(x, hl_map) end, hl)
   end
-  return hl_map[hl] or hl
+  local cur = hl
+  for _ = 1, 100 do
+    if type(cur) ~= 'string' then return hl end
+    if hl_map[cur] ~= nil then return hl_map[cur] end
+    cur = H.get_next_hl(cur)
+  end
+  return hl
+end
+
+-- Get global definition of highlight group following links. Don't use
+-- `synIDtrans()` or `nvim_get_hl()` with `link = false`, as they follow links
+-- inside highlight namespace of current window (like from 'winhighlight').
+H.get_global_hl = function(name)
+  for _ = 1, 100 do
+    local def = H.get_own_hl(name)
+    local next_name = H.get_next_hl(name, def)
+    if next_name == nil then return def end
+    name = next_name
+  end
+  return {}
+end
+
+-- Get own global definition of highlight group without creating it
+H.get_own_hl = function(name)
+  if vim.fn.hlexists(name) == 0 then return {} end
+  return vim.api.nvim_get_hl(0, { name = name })
+end
+
+-- Get group which is used instead of highlight group: link or parent group
+-- for not defined hierarchical ones (like `@a.b`)
+H.get_next_hl = function(name, def)
+  def = def or H.get_own_hl(name)
+  if type(def.link) == 'string' then return def.link end
+  if next(def) == nil then return name:match('^(.+)%.[^.]*$') end
 end
 
 -- Compute status line and winbar content (as text chunks and base highlight)
@@ -3039,6 +3073,15 @@ H.open_split_float = function(w, config)
   local normal_hl = H.get_normal_hl(winhighlight, w.is_current)
   local extra_hl = 'NormalFloat:' .. normal_hl .. (w.is_current and (',NormalNC:' .. normal_hl) or '')
   winhighlight = winhighlight == '' and extra_hl or (winhighlight .. ',' .. extra_hl)
+  -- Left border shows separator or split line of other window. Resolve its
+  -- highlighting globally (as it is already remapped for that window) and not
+  -- through remaps of this window (like default 'WinSeparator' links to
+  -- 'Normal' which can be remapped).
+  local left_border = type(config.border) == 'table' and config.border[8] or nil
+  local left_hl = type(left_border) == 'table' and left_border[2] or nil
+  if type(left_hl) == 'string' and left_hl ~= 'NormalFloat' and left_hl ~= 'NormalNC' then
+    winhighlight = winhighlight .. ',' .. left_hl .. ':' .. left_hl
+  end
   -- Ignore only window events for regular buffer (as ignoring all of them
   -- also affects buffer events)
   local eventignorewin = show_buf and 'WinScrolled,WinResized' or 'all'
@@ -3124,7 +3167,7 @@ end
 -- Neovim<0.12 transparent background becomes black during blending)
 H.can_fade_curtain = function(win_id, normal_hl)
   if H.get_win_hl_ns(win_id) ~= nil then return false end
-  local has_bg = vim.api.nvim_get_hl(0, { name = normal_hl, link = false }).bg ~= nil
+  local has_bg = H.get_global_hl(normal_hl).bg ~= nil
   return has_bg or vim.fn.has('nvim-0.12') == 1
 end
 
@@ -3235,13 +3278,7 @@ H.update_fade_cache = function()
   if not vim.o.termguicolors then return end
   local defs = {}
   for _, name in ipairs(vim.fn.getcompletion('', 'highlight')) do
-    -- Use parent group for not defined hierarchical ones (like `@a.b`)
-    local cur, def = name, {}
-    while cur ~= nil and next(def) == nil do
-      def = vim.api.nvim_get_hl(0, { id = vim.fn.synIDtrans(vim.fn.hlID(cur)) })
-      cur = cur:match('^(.+)%.[^.]*$')
-    end
-    defs[name] = def
+    defs[name] = H.get_global_hl(name)
   end
   if vim.deep_equal(defs, H.cache.fade.defs) then return end
   H.cache.fade.id, H.cache.fade.defs = H.cache.fade.id + 1, defs
